@@ -30,6 +30,7 @@ interface Config {
   follow_latest: boolean;
   custom_keywords_enabled: boolean;
   custom_keywords: string[];
+  heartbeat_log_enabled: boolean;
 }
 interface PairView {
   id: string;
@@ -76,6 +77,7 @@ const cfgEls = {
   followLatest: $<HTMLInputElement>("cfg-follow-latest"),
   keywordsEnabled: $<HTMLInputElement>("cfg-keywords-enabled"),
   keywords: $<HTMLTextAreaElement>("cfg-keywords"),
+  heartbeat: $<HTMLInputElement>("cfg-heartbeat"),
 };
 
 let watching = false;
@@ -93,6 +95,7 @@ function applyConfig(c: Config) {
   cfgEls.followLatest.checked = c.follow_latest;
   cfgEls.keywordsEnabled.checked = c.custom_keywords_enabled;
   cfgEls.keywords.value = (c.custom_keywords || []).join("\n");
+  cfgEls.heartbeat.checked = c.heartbeat_log_enabled;
 }
 
 function collectConfig(): Config {
@@ -115,6 +118,7 @@ function collectConfig(): Config {
       .split(/[\n,，]/)
       .map((s) => s.trim())
       .filter((s) => s.length > 0),
+    heartbeat_log_enabled: cfgEls.heartbeat.checked,
   };
 }
 

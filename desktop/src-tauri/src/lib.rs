@@ -44,6 +44,9 @@ pub struct Config {
     /// User-defined keywords (plain text, case-insensitive). If any appears in
     /// the last reply and no completion marker is present, a continue is sent.
     pub custom_keywords: Vec<String>,
+    /// When true, the monitor prints a periodic "heartbeat" log line per pair
+    /// describing the window/session state it sees each poll (throttled).
+    pub heartbeat_log_enabled: bool,
 }
 
 impl Default for Config {
@@ -61,6 +64,7 @@ impl Default for Config {
             follow_latest: false,
             custom_keywords_enabled: false,
             custom_keywords: Vec::new(),
+            heartbeat_log_enabled: false,
         }
     }
 }
@@ -156,6 +160,7 @@ struct Pair {
     sending_fingerprint: String,
     status: String,         // last status line, surfaced to the UI
     status_kind: String,
+    last_heartbeat: f64,    // last time a heartbeat log line was printed
 }
 
 impl Pair {
@@ -955,6 +960,59 @@ fn tick_pair(app: &AppHandle, state: &AppState, cfg: &Config, id: &str) {
     }
 
     let idle = now_secs() - mtime;
+
+    // Optional heartbeat: a periodic log line describing what the monitor sees
+    // for this pair (session state + whether its target window is found).
+    // Throttled to ~once every 3s per pair so it never floods the log.
+    if cfg.heartbeat_log_enabled {
+        let should_log = {
+            let mut watch = state.watch.lock().unwrap();
+            match watch.pairs.iter_mut().find(|p| p.id() == id) {
+                Some(p) if now_secs() - p.last_heartbeat >= 3.0 => {
+                    p.last_heartbeat = now_secs();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if should_log {
+            let (bound, target_kind) = {
+                let watch = state.watch.lock().unwrap();
+                match watch.pairs.iter().find(|p| p.id() == id) {
+                    Some(p) => (p.bound_hwnd, p.target_kind.clone()),
+                    None => return,
+                }
+            };
+            let kind = if target_kind.is_empty() { cfg.target_kind.clone() } else { target_kind };
+            let window_desc = match choose_target_window(&st.cwd, bound, &kind) {
+                Some(w) => format!("目标窗口=[{}] {}", w.kind_label, w.title),
+                None => "目标窗口=未找到".to_string(),
+            };
+            let session_state = if st.is_api_error() {
+                format!("API错误({})", st.last_error)
+            } else if st.stop_reason.as_deref() == Some("tool_use") {
+                "执行工具中".to_string()
+            } else if st.is_terminal() {
+                format!("已停止({})", st.stop_reason.clone().unwrap_or_default())
+            } else if st.stop_reason.is_none() {
+                "生成中/无停止标记".to_string()
+            } else {
+                format!("stop_reason={}", st.stop_reason.clone().unwrap_or_default())
+            };
+            emit_log(
+                app,
+                &format!(
+                    "[心跳][{}] 会话状态={}；静默={:.0}秒；{}",
+                    short_id(id),
+                    session_state,
+                    idle,
+                    window_desc
+                ),
+                "info",
+            );
+        }
+    }
+
     if idle >= cfg.quiet_seconds {
         evaluate_pair(app, state, cfg, id, &st);
     }
