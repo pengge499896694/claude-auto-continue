@@ -1,0 +1,37 @@
+# ---- Rust / Tauri ----
+/desktop/src-tauri/target/
+/desktop/src-tauri/gen/schemas/
+
+# ---- Node / frontend ----
+/desktop/node_modules/
+/desktop/dist/
+/desktop/dist-ssr/
+*.local
+
+# ---- Python (legacy implementation) ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+*.spec
+
+# ---- Build artifacts ----
+*.exe
+*.msi
+!desktop/src-tauri/icons/*.ico
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.sw?
+
+# ---- App runtime data / logs ----
+*.log
+
+# ---- Claude Code local tooling config ----
+.claude/

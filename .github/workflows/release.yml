@@ -1,0 +1,64 @@
+name: Release
+
+# 打一个 v 开头的 tag（例如 v1.0.0）时，自动编译 Windows x64 安装包并发布到 GitHub Release。
+on:
+  push:
+    tags:
+      - "v*"
+  # 也允许在 Actions 页面手动触发（用于测试）。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust (x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: 缓存 Rust 依赖
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: 安装前端依赖
+        working-directory: desktop
+        run: npm ci
+
+      - name: 编译并发布（Tauri）
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop
+          args: --target x86_64-pc-windows-msvc
+          # tagName / releaseName 用触发的 tag 名。
+          tagName: ${{ github.ref_name }}
+          releaseName: "Claude 自动续跑监听器 ${{ github.ref_name }}"
+          releaseBody: |
+            ## 下载安装
+
+            - **`.exe` 安装程序（推荐）**：下方 `ClaudeAutoContinue_*_x64-setup.exe`，双击即装。
+            - **`.msi` 安装包**：适合企业批量部署。
+
+            ### 系统要求
+            - Windows 10 / 11（64 位）
+            - Edge WebView2 运行时（Win11 及较新 Win10 自带；缺失时可从微软官网安装）
+
+            > 首次运行若被 SmartScreen 拦截，点“更多信息 → 仍要运行”即可（未签名软件的正常提示）。
+          releaseDraft: false
+          prerelease: false

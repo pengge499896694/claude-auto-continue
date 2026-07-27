@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude 自动续跑监听器</title>
+  <link rel="stylesheet" href="assets/element-plus.css" />
+  <script src="assets/vue.global.prod.js"></script>
+  <script src="assets/element-plus.full.min.js"></script>
+  <script src="assets/element-plus-icons.iife.min.js"></script>
+  <style>
+    :root {
+      --brand: #5b8cff;
+      --brand-2: #8b5cff;
+      --bg: #0d1117;
+      --panel: #161b26;
+    }
+    html, body { margin: 0; padding: 0; height: 100%; }
+    body {
+      background: radial-gradient(1200px 600px at 85% -10%, rgba(139, 92, 255, 0.18), transparent 60%),
+                  radial-gradient(1000px 500px at -10% 110%, rgba(91, 140, 255, 0.16), transparent 55%),
+                  var(--bg);
+      color: #e6ebf5;
+      font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+      -webkit-user-select: none;
+      user-select: none;
+      overflow: hidden;
+    }
+    #app { height: 100vh; display: flex; flex-direction: column; }
+
+    .app-header {
+      display: flex; align-items: center; gap: 14px;
+      padding: 18px 24px 12px;
+    }
+    .logo {
+      width: 46px; height: 46px; border-radius: 14px;
+      background: linear-gradient(135deg, var(--brand), var(--brand-2));
+      display: grid; place-items: center;
+      font-size: 24px; color: #fff; font-weight: 700;
+      box-shadow: 0 8px 24px rgba(91, 140, 255, 0.35);
+    }
+    .titles h1 {
+      margin: 0; font-size: 20px; font-weight: 700; letter-spacing: 0.3px;
+      background: linear-gradient(90deg, #fff, #b9c6ff);
+      -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    .titles p { margin: 4px 0 0; font-size: 12.5px; color: #8a97b3; }
+    .header-status { margin-left: auto; }
+
+    .content {
+      flex: 1; min-height: 0;
+      padding: 6px 24px 18px;
+      display: flex; flex-direction: column; gap: 14px;
+      overflow: auto;
+    }
+
+    .glass {
+      background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.008));
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 16px;
+      backdrop-filter: blur(6px);
+    }
+    .el-card { background: transparent !important; border: none !important; }
+    .card-title { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; }
+    .card-title .idx {
+      width: 20px; height: 20px; border-radius: 6px; font-size: 12px;
+      background: rgba(91,140,255,0.18); color: #9db8ff;
+      display: grid; place-items: center; font-weight: 700;
+    }
+
+    .row { display: flex; gap: 10px; align-items: center; }
+    .grow { flex: 1; min-width: 0; }
+    .field-label { font-size: 12px; color: #8a97b3; margin-bottom: 6px; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 20px; }
+    .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px 18px; }
+
+    .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .controls .spacer { flex: 1; }
+
+    .log-card { flex: 1; min-height: 200px; display: flex; flex-direction: column; }
+    .log-card .el-card__body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+    .log-box {
+      flex: 1; min-height: 0; overflow: auto; margin-top: 10px;
+      background: #0a0e16; border-radius: 12px; padding: 12px 14px;
+      font-family: "Cascadia Code", "Consolas", monospace; font-size: 12.5px; line-height: 1.7;
+      border: 1px solid rgba(255,255,255,0.05);
+    }
+    .log-line { white-space: pre-wrap; word-break: break-word; }
+    .log-time { color: #556; margin-right: 8px; }
+    .lv-info { color: #dbe4f5; }
+    .lv-ok   { color: #3ecf8e; }
+    .lv-warn { color: #f0b429; }
+    .lv-err  { color: #ff6b6b; }
+
+    .footer { font-size: 12px; color: #6f7c96; padding: 0 2px; }
+    .pulse { animation: pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-thumb { background: #2a3550; border-radius: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="app-header">
+      <div class="logo">⟳</div>
+      <div class="titles">
+        <h1>Claude 自动续跑监听器</h1>
+        <p>监听 ~/.claude 会话记录,发现截断或明确未完成后,自动向 Claude Code 或 Claude CLI 发送继续</p>
+      </div>
+      <div class="header-status">
+        <el-tag :type="statusTag.type" effect="dark" round size="large">
+          <span :class="{ pulse: watching }">● </span>{{ status }}
+        </el-tag>
+      </div>
+    </div>
+
+    <div class="content">
+      <!-- Session card -->
+      <el-card class="glass" shadow="never">
+        <template #header>
+          <div class="card-title"><span class="idx">1</span> Claude 会话</div>
+        </template>
+        <div class="row">
+          <el-select v-model="selectedSession" filterable placeholder="选择会话" class="grow"
+                     @change="onSelectSession" :teleported="false">
+            <el-option v-for="s in sessions" :key="s.path" :label="s.display" :value="s.path" />
+          </el-select>
+          <el-button :icon="Icons.Refresh" @click="refreshSessions">刷新会话</el-button>
+          <el-button :icon="Icons.FolderOpened" @click="openSessionFolder">打开目录</el-button>
+        </div>
+        <div style="height: 12px"></div>
+        <div class="row">
+          <span class="field-label" style="margin:0">目标窗口</span>
+          <el-select v-model="selectedWindow" placeholder="自动查找" class="grow"
+                     @change="onSelectWindow" :teleported="false">
+            <el-option label="自动查找(优先匹配会话项目)" value="__auto__" />
+            <el-option v-for="w in windows" :key="w.hwnd" :label="w.display" :value="String(w.hwnd)" />
+          </el-select>
+          <el-button :icon="Icons.Refresh" @click="refreshWindows">刷新窗口</el-button>
+          <el-button :icon="Icons.Aim" @click="bindWindow">3秒后绑定当前窗口</el-button>
+        </div>
+      </el-card>
+
+      <!-- Settings card -->
+      <el-card class="glass" shadow="never">
+        <template #header>
+          <div class="card-title"><span class="idx">2</span> 监听设置</div>
+        </template>
+        <div class="grid2">
+          <div>
+            <div class="field-label">客户端类型</div>
+            <el-select v-model="cfg.target_kind" class="grow" style="width:100%" :teleported="false">
+              <el-option label="自动(VS Code 或终端)" value="auto" />
+              <el-option label="Claude Code(VS Code 插件)" value="vscode" />
+              <el-option label="Claude CLI(终端)" value="terminal" />
+            </el-select>
+          </div>
+          <div>
+            <div class="field-label">判断模式</div>
+            <el-select v-model="cfg.mode" style="width:100%" :teleported="false">
+              <el-option label="安全:只处理 max_tokens" value="safe" />
+              <el-option label="智能:截断 + 明确未完成语句" value="smart" />
+              <el-option label="严格:直到检测到完成标记" value="strict" />
+            </el-select>
+          </div>
+        </div>
+        <div style="height:14px"></div>
+        <div class="grid4">
+          <div>
+            <div class="field-label">静默等待(秒)</div>
+            <el-input-number v-model="cfg.quiet_seconds" :min="0.5" :step="1" controls-position="right" style="width:100%" />
+          </div>
+          <div>
+            <div class="field-label">最大续跑次数</div>
+            <el-input-number v-model="cfg.max_continues" :min="1" :step="1" controls-position="right" style="width:100%" />
+          </div>
+          <div>
+            <div class="field-label">发送冷却(秒)</div>
+            <el-input-number v-model="cfg.cooldown_seconds" :min="0.5" :step="1" controls-position="right" style="width:100%" />
+          </div>
+          <div>
+            <div class="field-label">断线判定(秒)</div>
+            <el-input-number v-model="cfg.stalled_seconds" :min="1" :step="5" controls-position="right" style="width:100%" />
+          </div>
+        </div>
+        <div style="height:14px"></div>
+        <div class="field-label">续跑提示词</div>
+        <el-input v-model="cfg.prompt" type="textarea" :rows="2" resize="none" placeholder="发送给 Claude 的续跑提示词" />
+        <div style="height:14px"></div>
+        <div class="row" style="gap:24px">
+          <el-switch v-model="cfg.check_existing" active-text="启动时检查当前已停止状态" />
+          <el-switch v-model="cfg.follow_latest" active-text="自动跟随最新会话(多窗口时慎用)" />
+        </div>
+      </el-card>
+
+      <!-- Controls -->
+      <div class="controls">
+        <el-button v-if="!watching" type="primary" size="large" round :icon="Icons.VideoPlay" @click="startWatch">开始监听</el-button>
+        <el-button v-else type="danger" size="large" round :icon="Icons.VideoPause" @click="stopWatch">停止监听</el-button>
+        <el-button size="large" round :icon="Icons.DataAnalysis" @click="analyzeNow">立即分析一次</el-button>
+        <el-button size="large" round :icon="Icons.Promotion" @click="testSend">测试发送</el-button>
+        <span class="spacer"></span>
+        <el-button size="large" round text bg :icon="Icons.Document" @click="openLog">打开日志</el-button>
+      </div>
+
+      <!-- Log -->
+      <el-card class="glass log-card" shadow="never">
+        <template #header>
+          <div class="card-title"><el-icon><component :is="Icons.Tickets" /></el-icon> 运行日志</div>
+        </template>
+        <div class="log-box" ref="logBox">
+          <div v-for="(l, i) in logs" :key="i" class="log-line">
+            <span class="log-time">{{ l.time }}</span><span :class="'lv-' + l.level">{{ l.msg }}</span>
+          </div>
+        </div>
+      </el-card>
+
+      <div class="footer">安全提示:程序最多续跑指定次数;不会自动批准权限弹窗,也不会绕过 Claude Code 的安全确认。</div>
+    </div>
+  </div>
+
+  <script>
+    const { createApp, ref, reactive, computed, nextTick, onMounted } = Vue;
+
+    const app = createApp({
+      setup() {
+        const Icons = ElementPlusIconsVue;
+        const sessions = ref([]);
+        const windows = ref([]);
+        const selectedSession = ref('');
+        const selectedWindow = ref('__auto__');
+        const logs = ref([]);
+        const logBox = ref(null);
+        const status = ref('未启动');
+        const statusKind = ref('idle');
+        const watching = ref(false);
+        const cfg = reactive({
+          target_kind: 'auto', mode: 'smart',
+          quiet_seconds: 7, max_continues: 12, cooldown_seconds: 15, stalled_seconds: 60,
+          prompt: '', check_existing: true, follow_latest: false,
+        });
+
+        const statusTag = computed(() => {
+          const map = { idle: 'info', info: 'primary', run: 'success', warn: 'warning', err: 'danger' };
+          return { type: map[statusKind.value] || 'info' };
+        });
+
+        const api = () => window.pywebview.api;
+
+        function pushLog(time, msg, level) {
+          logs.value.push({ time, msg, level: level || 'info' });
+          if (logs.value.length > 500) logs.value.splice(0, logs.value.length - 500);
+          nextTick(() => { if (logBox.value) logBox.value.scrollTop = logBox.value.scrollHeight; });
+        }
+
+        async function refreshSessions() {
+          const data = await api().refresh_sessions();
+          sessions.value = data.sessions;
+          if (data.selected) selectedSession.value = data.selected;
+        }
+        async function refreshWindows() {
+          const data = await api().refresh_windows();
+          windows.value = data.windows;
+          selectedWindow.value = data.selected || '__auto__';
+        }
+        function onSelectSession() { api().select_session(selectedSession.value); }
+        function onSelectWindow() { api().select_window(selectedWindow.value); }
+        function openSessionFolder() { api().open_session_folder(); }
+        function openLog() { api().open_log(); }
+        function bindWindow() { api().bind_after_countdown(); }
+
+        async function startWatch() {
+          const ok = await api().start_watch(JSON.parse(JSON.stringify(cfg)));
+          if (!ok) ElementPlus.ElMessage.error('请先选择有效的 Claude 会话');
+        }
+        function stopWatch() { api().stop_watch(); }
+        function analyzeNow() { api().save_config(JSON.parse(JSON.stringify(cfg))); api().analyze_now(); }
+
+        async function testSend() {
+          try {
+            await ElementPlus.ElMessageBox.confirm(
+              '测试会真实切换到目标窗口(VS Code 或终端),并发送当前续跑提示词。是否继续?',
+              '测试发送', { type: 'warning', confirmButtonText: '发送', cancelButtonText: '取消' }
+            );
+          } catch (e) { return; }
+          api().save_config(JSON.parse(JSON.stringify(cfg)));
+          api().test_send();
+        }
+
+        // Event bus from Python
+        window.__emit = (name, payload) => {
+          if (name === 'log') pushLog(payload.time, payload.msg, payload.level);
+          else if (name === 'status') { status.value = payload.text; statusKind.value = payload.kind; }
+          else if (name === 'watch') watching.value = payload.on;
+          else if (name === 'sessions') { sessions.value = payload.sessions; if (payload.selected) selectedSession.value = payload.selected; }
+          else if (name === 'windows') { windows.value = payload.windows; selectedWindow.value = payload.selected || '__auto__'; }
+          else if (name === 'toast') ElementPlus.ElMessage[payload.type || 'info'](payload.msg);
+        };
+
+        onMounted(async () => {
+          // Wait for pywebview bridge
+          let tries = 0;
+          while (!window.pywebview || !window.pywebview.api) {
+            await new Promise(r => setTimeout(r, 50));
+            if (++tries > 100) break;
+          }
+          const init = await api().get_initial();
+          Object.assign(cfg, init.config);
+          sessions.value = init.sessions;
+          windows.value = init.windows;
+          selectedSession.value = init.selected_session || '';
+          selectedWindow.value = init.selected_window || '__auto__';
+          (init.logs || []).forEach(l => pushLog(l.time, l.msg, l.level));
+        });
+
+        return {
+          Icons, sessions, windows, selectedSession, selectedWindow, logs, logBox,
+          status, statusKind, statusTag, watching, cfg,
+          refreshSessions, refreshWindows, onSelectSession, onSelectWindow,
+          openSessionFolder, openLog, bindWindow, startWatch, stopWatch, analyzeNow, testSend,
+        };
+      },
+    });
+    app.use(ElementPlus);
+    for (const [k, c] of Object.entries(ElementPlusIconsVue)) app.component(k, c);
+    app.mount('#app');
+  </script>
+</body>
+</html>
