@@ -1,6 +1,6 @@
 name: Release
 
-# 打一个 v 开头的 tag（例如 v1.0.0）时，自动编译 Windows x64 安装包并发布到 GitHub Release。
+# 打一个 v 开头的 tag（例如 v1.0.0）时，自动编译 Windows 与 macOS 安装包并发布到同一个 GitHub Release。
 on:
   push:
     tags:
@@ -12,21 +12,39 @@ permissions:
   contents: write
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows 64 位
+          - platform: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            args: "--target x86_64-pc-windows-msvc"
+          # macOS Apple Silicon（M1/M2/M3…）
+          - platform: macos-latest
+            rust_target: aarch64-apple-darwin
+            args: "--target aarch64-apple-darwin"
+          # macOS Intel
+          - platform: macos-latest
+            rust_target: x86_64-apple-darwin
+            args: "--target x86_64-apple-darwin"
+
+    runs-on: ${{ matrix.platform }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Rust (x86_64-pc-windows-msvc)
+      - name: 安装 Rust (${{ matrix.rust_target }})
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.rust_target }}
 
       - name: 缓存 Rust 依赖
         uses: swatinem/rust-cache@v2
         with:
           workspaces: desktop/src-tauri
+          key: ${{ matrix.rust_target }}
 
       - name: 安装 Node.js
         uses: actions/setup-node@v4
@@ -45,20 +63,29 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: desktop
-          args: --target x86_64-pc-windows-msvc
-          # tagName / releaseName 用触发的 tag 名。
+          args: ${{ matrix.args }}
+          # 所有平台的产物都发布到同一个以 tag 命名的 Release。
           tagName: ${{ github.ref_name }}
           releaseName: "Claude 自动续跑监听器 ${{ github.ref_name }}"
           releaseBody: |
             ## 下载安装
 
-            - **`.exe` 安装程序（推荐）**：下方 `ClaudeAutoContinue_*_x64-setup.exe`，双击即装。
+            ### Windows（64 位）
+            - **`.exe` 安装程序（推荐）**：`ClaudeAutoContinue_*_x64-setup.exe`，双击即装。
             - **`.msi` 安装包**：适合企业批量部署。
+            - 需要 Edge WebView2 运行时（Win11 及较新 Win10 自带）。
+            - 首次运行若被 SmartScreen 拦截，点“更多信息 → 仍要运行”。
 
-            ### 系统要求
-            - Windows 10 / 11（64 位）
-            - Edge WebView2 运行时（Win11 及较新 Win10 自带；缺失时可从微软官网安装）
+            ### macOS
+            - **Apple 芯片（M 系列）**：下载 `*_aarch64.dmg`。
+            - **Intel 芯片**：下载 `*_x64.dmg`。
+            - 打开 `.dmg` 后把应用拖进“应用程序”。
+            - **首次打开被拦截**（提示“已损坏”或“无法验证开发者”）：打开“终端”，运行
+              `xattr -cr "/Applications/ClaudeAutoContinue.app"`，再双击打开即可。
+            - **必须授权**：首次点“开始监听/测试发送”时，到
+              系统设置 → 隐私与安全性 → 辅助功能 里勾选本应用；若仍失败，
+              再到 隐私与安全性 → 自动化 中允许它控制“系统事件”。
 
-            > 首次运行若被 SmartScreen 拦截，点“更多信息 → 仍要运行”即可（未签名软件的正常提示）。
+            > 未签名版本，以上放行步骤是 macOS 对未签名应用的正常要求，一次授权后即可正常使用。
           releaseDraft: false
           prerelease: false

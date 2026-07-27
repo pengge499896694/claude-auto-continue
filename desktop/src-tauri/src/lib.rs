@@ -55,16 +55,13 @@ impl Default for Config {
 }
 
 fn app_dir() -> PathBuf {
-    let base = std::env::var("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs_home());
+    // Windows -> %APPDATA%\ClaudeAutoContinue
+    // macOS   -> ~/Library/Application Support/ClaudeAutoContinue
+    // Fall back to home, then the current dir, so this never panics.
+    let base = dirs::config_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
     base.join("ClaudeAutoContinue")
-}
-
-fn dirs_home() -> PathBuf {
-    std::env::var("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn config_path() -> PathBuf {

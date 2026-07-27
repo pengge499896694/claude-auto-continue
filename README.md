@@ -1,30 +1,45 @@
-# Claude Code 自动续跑监听器（Windows）
+# Claude Code 自动续跑监听器（Windows / macOS）
 
 一个无需修改 Claude 客户端的轻量监听程序。它直接读取 Claude 本地会话文件，判断当前回合是否因为输出长度或明确的“尚未完成”状态而停止，然后自动回到目标窗口，发送续跑提示词。
 
-当前主版本是基于 **Tauri（Rust + 系统自带 WebView2）** 的原生安装版：启动快、内存占用低、白色亮色界面，并提供正式的 `.exe` / `.msi` 安装程序。仓库根目录的 Python 版本（`app.pyw` / `app_web.pyw`）为历史实现，见文末“历史实现”。
+当前主版本是基于 **Tauri（Rust + 系统自带 WebView）** 的原生安装版：启动快、内存占用低、白色亮色界面。Windows 提供 `.exe` / `.msi` 安装程序，macOS 提供 `.dmg`。仓库根目录的 Python 版本（`app.pyw` / `app_web.pyw`）为历史实现，见文末“历史实现”。
 
 ## 支持的客户端
 
 同时兼容两种 Claude 客户端，它们都会写入相同的 `~/.claude/projects/<项目>/<会话ID>.jsonl` 会话文件，因此判断逻辑通用，区别只在发送方式：
 
 - **Claude Code（VS Code 插件）**：通过命令面板执行 `Claude Code: Focus input`，聚焦输入框后发送。
-- **Claude CLI（终端）**：识别 Windows Terminal、PowerShell、cmd、conhost、Alacritty、WezTerm、Hyper、Tabby 等终端窗口，直接把提示词输入到正在运行的 `claude` 命令行。
+- **Claude CLI（终端）**：识别常见终端窗口，直接把提示词输入到正在运行的 `claude` 命令行。Windows 上支持 Windows Terminal、PowerShell、cmd、conhost、Alacritty、WezTerm、Hyper、Tabby；macOS 上支持 Terminal、iTerm2、Warp、Alacritty、kitty、WezTerm、Hyper、Tabby、Ghostty。
+
+平台差异：Windows 通过 Win32 API 枚举窗口并模拟按键；macOS 通过 `osascript`（System Events）驱动，续跑提示词经剪贴板 + Cmd-V 输入（对非 ASCII 文本更可靠）。macOS 首次使用需在“系统设置 → 隐私与安全性 → 辅助功能”中授权本应用。
 
 在“客户端类型”下拉框里可选择 `自动`、`Claude Code（VS Code 插件）` 或 `Claude CLI（终端）`。自动模式下会优先使用已绑定/前台窗口，否则优先 VS Code，再退回终端。
 
 ## 安装与启动
 
-从 `desktop/src-tauri/target/release/bundle/` 取安装包，任选其一：
+推荐从 [GitHub Releases](../../releases) 下载对应平台的安装包。
+
+**Windows（64 位）**
 
 ```text
-nsis/ClaudeAutoContinue_1.0.0_x64-setup.exe   （安装程序，约 2.3MB）
-msi/ClaudeAutoContinue_1.0.0_x64_en-US.msi     （MSI 安装包，约 3.6MB）
+ClaudeAutoContinue_*_x64-setup.exe   （安装程序，推荐）
+ClaudeAutoContinue_*_x64_en-US.msi   （MSI 安装包，适合企业部署）
 ```
 
-双击安装后，从开始菜单启动“Claude 自动续跑监听器”即可。也可以直接运行免安装的 `desktop/src-tauri/target/release/desktop.exe`。
+双击安装后，从开始菜单启动“Claude 自动续跑监听器”。Windows 10/11 通常已内置 Edge WebView2 运行时；若缺失，可从微软官网安装 “WebView2 Runtime”。首次运行若被 SmartScreen 拦截，点“更多信息 → 仍要运行”。
 
-Windows 10/11 通常已内置 Edge WebView2 运行时；若缺失，可从微软官网安装 “WebView2 Runtime”。
+**macOS**
+
+- Apple 芯片（M 系列）下载 `*_aarch64.dmg`，Intel 芯片下载 `*_x64.dmg`。
+- 打开 `.dmg` 后把应用拖进“应用程序”。
+- 当前为**未签名**版本，首次打开若提示“已损坏”或“无法验证开发者”，在终端运行一次：
+
+  ```bash
+  xattr -cr "/Applications/ClaudeAutoContinue.app"
+  ```
+
+  然后双击打开即可。
+- 首次点“开始监听/测试发送”时，需到 系统设置 → 隐私与安全性 → **辅助功能** 勾选本应用；若仍失败，再到 隐私与安全性 → **自动化** 中允许它控制“系统事件(System Events)”。一次授权后即可正常使用。
 
 ## 推荐使用步骤
 
@@ -67,8 +82,8 @@ Windows 10/11 通常已内置 Edge WebView2 运行时；若缺失，可从微软
 保存在：
 
 ```text
-%APPDATA%\ClaudeAutoContinue\config.json
-%APPDATA%\ClaudeAutoContinue\monitor.log
+Windows: %APPDATA%\ClaudeAutoContinue\config.json / monitor.log
+macOS:   ~/Library/Application Support/ClaudeAutoContinue/config.json / monitor.log
 ```
 
 ## 项目结构与技术栈
@@ -76,7 +91,10 @@ Windows 10/11 通常已内置 Edge WebView2 运行时；若缺失，可从微软
 主版本源码在 `desktop/`，Rust 逻辑完整对应原 Python 模块：
 
 - `desktop/src-tauri/src/core.rs`：会话分析、三种判断模式、断线指纹（对应旧 `core.py`）。
-- `desktop/src-tauri/src/automation.rs`：基于 `windows-sys` 的 Win32 窗口枚举/激活/按键，含 VS Code 命令面板与终端 CLI 双发送路径（对应旧 `windows_automation.py`）。
+- `desktop/src-tauri/src/automation.rs`：跨平台调度层，持有共享的 `WindowItem` 类型与会话存活检查；按平台委托给子模块：
+  - `desktop/src-tauri/src/automation/windows.rs`：基于 `windows-sys` 的 Win32 窗口枚举/激活/按键。
+  - `desktop/src-tauri/src/automation/macos.rs`：基于 `osascript`（System Events）的应用枚举/激活/按键，提示词经剪贴板 + Cmd-V 输入。
+  两者暴露相同的函数集，含 VS Code 命令面板与终端 CLI 双发送路径（对应旧 `windows_automation.py`）。
 - `desktop/src-tauri/src/lib.rs`：Tauri 命令层、后台监听线程、配置读写。
 - `desktop/index.html` / `desktop/src/styles.css` / `desktop/src/main.ts`：手写的白色卡片式界面，不依赖任何重型组件库（打包产物约 18KB），因此启动快、不卡顿。
 
