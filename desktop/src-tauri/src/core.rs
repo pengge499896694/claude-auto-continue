@@ -90,6 +90,7 @@ pub struct SessionItem {
 
 #[derive(Debug, Clone, Default)]
 pub struct TurnState {
+    #[allow(dead_code)]
     pub path: String,
     pub session_id: String,
     pub cwd: String,
@@ -101,14 +102,32 @@ pub struct TurnState {
     pub assistant_text: String,
     pub has_unclosed_code_fence: bool,
     pub fingerprint: String,
+    /// The client that produced this session, taken from the transcript's
+    /// `entrypoint` field: "claude-vscode" | "claude-desktop" | "claude-cli" | ...
+    /// Empty when unknown. Used to auto-pick the delivery path.
+    pub entrypoint: String,
+    /// Set when the *last* event in the transcript is an unrecovered API error
+    /// (e.g. 502/524/429/connection error). Carries a human-readable summary
+    /// like "502 Upstream service temporarily unavailable". Empty otherwise.
+    ///
+    /// Only the trailing error matters: if Claude Code retried and recovered,
+    /// later events overwrite this back to empty, so a non-empty value that
+    /// survives the quiet period means the turn is genuinely stuck.
+    pub last_error: String,
 }
 
 impl TurnState {
+    /// A normally-stopped turn (Claude finished a response and is waiting).
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.stop_reason.as_deref(),
             Some("end_turn") | Some("max_tokens") | Some("stop_sequence")
         )
+    }
+
+    /// The turn ended on an unrecovered API error rather than a normal stop.
+    pub fn is_api_error(&self) -> bool {
+        !self.last_error.is_empty()
     }
 }
 
@@ -317,6 +336,16 @@ pub fn analyze_transcript(path: &Path) -> TurnState {
         }
     }
 
+    // The client that wrote this session (same for every row); grab it once.
+    for obj in &objects {
+        if let Some(ep) = obj.get("entrypoint").and_then(|v| v.as_str()) {
+            if !ep.is_empty() {
+                state.entrypoint = ep.to_string();
+                break;
+            }
+        }
+    }
+
     let start = if last_user_index >= 0 {
         (last_user_index + 1) as usize
     } else {
@@ -324,6 +353,14 @@ pub fn analyze_transcript(path: &Path) -> TurnState {
     };
     let mut assistant_text: Vec<String> = Vec::new();
     for obj in &objects[start..] {
+        // An unrecovered API error is a trailing `system/api_error` row. We set
+        // it here and clear it as soon as a later assistant message appears, so
+        // only an error that Claude never recovered from survives to the end.
+        if is_api_error_event(obj) {
+            state.last_error = api_error_summary(obj);
+            continue;
+        }
+
         let message = match obj.get("message") {
             Some(m) if m.is_object() => m,
             _ => continue,
@@ -331,6 +368,9 @@ pub fn analyze_transcript(path: &Path) -> TurnState {
         if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
             continue;
         }
+        // A real assistant message means the request went through — clear any
+        // earlier transient error so it does not falsely trigger a continue.
+        state.last_error.clear();
         if let Some(sid) = obj.get("sessionId").and_then(|v| v.as_str()) {
             state.session_id = sid.to_string();
         }
@@ -361,17 +401,91 @@ pub fn analyze_transcript(path: &Path) -> TurnState {
     state.assistant_text = assistant_text.join("\n").trim().to_string();
     state.has_unclosed_code_fence = state.assistant_text.matches("```").count() % 2 == 1;
     state.fingerprint = format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}",
         state.session_id,
         state.last_user_uuid,
         state.last_assistant_uuid,
         state.last_assistant_timestamp,
-        state.stop_reason.clone().unwrap_or_default()
+        state.stop_reason.clone().unwrap_or_default(),
+        state.last_error,
     );
     state
 }
 
-pub fn decide_continue(state: &TurnState, mode: &str) -> ContinueDecision {
+/// A `system` row Claude writes when an API request fails (before retrying).
+fn is_api_error_event(obj: &serde_json::Value) -> bool {
+    obj.get("type").and_then(|v| v.as_str()) == Some("system")
+        && obj.get("subtype").and_then(|v| v.as_str()) == Some("api_error")
+}
+
+/// A short human-readable summary of an api_error row, e.g.
+/// "502 Upstream service temporarily unavailable" or "429 ...".
+fn api_error_summary(obj: &serde_json::Value) -> String {
+    let error = obj.get("error");
+    // Prefer the pre-formatted one-liner Claude provides.
+    if let Some(f) = error
+        .and_then(|e| e.get("formatted"))
+        .and_then(|v| v.as_str())
+    {
+        if !f.trim().is_empty() {
+            return truncate_summary(f);
+        }
+    }
+    // Fall back to status + message.
+    let status = error
+        .and_then(|e| e.get("status"))
+        .and_then(|v| v.as_u64())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let message = error
+        .and_then(|e| e.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("API 错误");
+    let combined = if status.is_empty() {
+        message.to_string()
+    } else {
+        format!("{} {}", status, message)
+    };
+    truncate_summary(&combined)
+}
+
+fn truncate_summary(s: &str) -> String {
+    let one_line = s.split(['\n', '\r']).next().unwrap_or(s).trim();
+    let clipped: String = one_line.chars().take(120).collect();
+    clipped
+}
+
+/// Case-insensitive substring match of any user-defined keyword against the text.
+/// Keywords are plain text (not regex), so non-technical users can list phrases
+/// like "已暂停" or "waiting for" without worrying about escaping.
+pub fn custom_keyword_hit(text: &str, keywords: &[String]) -> Option<String> {
+    let lowered = text.to_lowercase();
+    for kw in keywords {
+        let k = kw.trim();
+        if k.is_empty() {
+            continue;
+        }
+        if lowered.contains(&k.to_lowercase()) {
+            return Some(k.to_string());
+        }
+    }
+    None
+}
+
+/// Decide whether a stopped/failed turn should receive a continue prompt.
+///
+/// `custom_keywords` are extra user-defined "not done" signals; pass an empty
+/// slice when the feature is disabled.
+pub fn decide_continue(state: &TurnState, mode: &str, custom_keywords: &[String]) -> ContinueDecision {
+    // An unrecovered API error (502/524/429/connection error/overloaded ...) is
+    // an abnormal termination the user explicitly wants retried, in every mode.
+    if state.is_api_error() {
+        return ContinueDecision {
+            should_continue: true,
+            reason: format!("检测到未恢复的 API 错误：{}", state.last_error),
+        };
+    }
+
     if state.stop_reason.as_deref() == Some("max_tokens") {
         return ContinueDecision {
             should_continue: true,
@@ -392,17 +506,28 @@ pub fn decide_continue(state: &TurnState, mode: &str) -> ContinueDecision {
         };
     }
 
+    let text = state.assistant_text.trim();
+    let unfinished = matches_any(text, &UNFINISHED_RE);
+    let complete = matches_any(text, &COMPLETION_RE);
+
+    // Custom keywords work in every mode: if one matches and the reply does not
+    // clearly claim completion, treat the task as unfinished and continue.
+    if let Some(hit) = custom_keyword_hit(text, custom_keywords) {
+        if !complete {
+            return ContinueDecision {
+                should_continue: true,
+                reason: format!("命中自定义关键字“{}”，且未见完成标记", hit),
+            };
+        }
+    }
+
     let mode = mode.trim().to_lowercase();
     if mode == "safe" {
         return ContinueDecision {
             should_continue: false,
-            reason: "安全模式只处理 max_tokens".into(),
+            reason: "安全模式只处理 max_tokens 与 API 错误".into(),
         };
     }
-
-    let text = state.assistant_text.trim();
-    let unfinished = matches_any(text, &UNFINISHED_RE);
-    let complete = matches_any(text, &COMPLETION_RE);
 
     if mode == "smart" {
         if unfinished {
@@ -461,50 +586,50 @@ mod tests {
     fn max_tokens_always_continues() {
         // Even safe mode must continue on a hard length truncation.
         let st = state("max_tokens", "正在实现");
-        assert!(decide_continue(&st, "safe").should_continue);
-        assert!(decide_continue(&st, "smart").should_continue);
-        assert!(decide_continue(&st, "strict").should_continue);
+        assert!(decide_continue(&st, "safe", &[]).should_continue);
+        assert!(decide_continue(&st, "smart", &[]).should_continue);
+        assert!(decide_continue(&st, "strict", &[]).should_continue);
     }
 
     #[test]
     fn smart_continues_on_explicit_unfinished() {
         let st = state("end_turn", "还需要继续完成剩余工作。");
-        assert!(decide_continue(&st, "smart").should_continue);
+        assert!(decide_continue(&st, "smart", &[]).should_continue);
     }
 
     #[test]
     fn smart_stops_on_normal_completion() {
         let st = state("end_turn", "任务已完成，测试已通过。");
-        assert!(!decide_continue(&st, "smart").should_continue);
-        assert!(!decide_continue(&st, "strict").should_continue);
+        assert!(!decide_continue(&st, "smart", &[]).should_continue);
+        assert!(!decide_continue(&st, "strict", &[]).should_continue);
     }
 
     #[test]
     fn safe_ignores_plain_end_turn() {
         let st = state("end_turn", "还需要继续");
-        assert!(!decide_continue(&st, "safe").should_continue);
+        assert!(!decide_continue(&st, "safe", &[]).should_continue);
     }
 
     #[test]
     fn unclosed_code_fence_continues_in_smart() {
         let st = state("end_turn", "```python\nprint('x')");
         assert!(st.has_unclosed_code_fence);
-        assert!(decide_continue(&st, "smart").should_continue);
+        assert!(decide_continue(&st, "smart", &[]).should_continue);
     }
 
     #[test]
     fn tool_use_is_not_terminal() {
         let st = state("tool_use", "");
         assert!(!st.is_terminal());
-        assert!(!decide_continue(&st, "smart").should_continue);
+        assert!(!decide_continue(&st, "smart", &[]).should_continue);
     }
 
     #[test]
     fn strict_continues_until_completion_marker() {
         let st = state("end_turn", "这一步做完了，我先看看。");
-        assert!(decide_continue(&st, "strict").should_continue);
+        assert!(decide_continue(&st, "strict", &[]).should_continue);
         let done = state("end_turn", "全部完成 [[AUTO_CONTINUE_DONE]]");
-        assert!(!decide_continue(&done, "strict").should_continue);
+        assert!(!decide_continue(&done, "strict", &[]).should_continue);
     }
 
     // ---- transcript parsing on a real temp .jsonl file --------------------
@@ -550,7 +675,7 @@ mod tests {
         assert_eq!(st.cwd, "E:\\demo");
         assert!(st.assistant_text.contains("剩余工作"));
         assert!(!st.fingerprint.is_empty());
-        assert!(decide_continue(&st, "smart").should_continue);
+        assert!(decide_continue(&st, "smart", &[]).should_continue);
     }
 
     #[test]
@@ -573,12 +698,100 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         assert_eq!(st.stop_reason.as_deref(), Some("max_tokens"));
-        assert!(decide_continue(&st, "safe").should_continue);
+        assert!(decide_continue(&st, "safe", &[]).should_continue);
     }
 
     #[test]
     fn project_display_name_rebuilds_drive_path() {
         assert_eq!(project_display_name("e--ai-claude"), "E:\\ai-claude");
         assert_eq!(project_display_name("plain-name"), "plain-name");
+    }
+
+    // ---- API-error detection ---------------------------------------------
+    fn api_error_row(status: u64, formatted: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "system", "subtype": "api_error", "level": "error",
+            "sessionId": "s3", "entrypoint": "claude-vscode",
+            "error": {"status": status, "formatted": formatted, "message": "..."},
+            "source": "request_retry"
+        })
+    }
+
+    #[test]
+    fn trailing_api_error_triggers_continue_in_every_mode() {
+        // Error is the last event → unrecovered → must continue.
+        let path = write_jsonl(&[
+            serde_json::json!({
+                "type": "user", "uuid": "u1", "sessionId": "s3",
+                "message": {"role": "user", "content": "开发"}
+            }),
+            api_error_row(502, "502 Upstream service temporarily unavailable"),
+        ]);
+        let st = analyze_transcript(&path);
+        let _ = fs::remove_file(&path);
+
+        assert!(st.is_api_error());
+        assert!(st.last_error.contains("502"));
+        for mode in ["safe", "smart", "strict"] {
+            assert!(decide_continue(&st, mode, &[]).should_continue, "mode={mode}");
+        }
+    }
+
+    #[test]
+    fn recovered_api_error_does_not_trigger() {
+        // Error followed by a real assistant reply → recovered → no trigger.
+        let path = write_jsonl(&[
+            serde_json::json!({
+                "type": "user", "uuid": "u1", "sessionId": "s3",
+                "message": {"role": "user", "content": "开发"}
+            }),
+            api_error_row(429, "429 Concurrency limit exceeded"),
+            serde_json::json!({
+                "type": "assistant", "uuid": "a1", "sessionId": "s3",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "任务已完成，测试已通过。"}],
+                    "stop_reason": "end_turn"
+                }
+            }),
+        ]);
+        let st = analyze_transcript(&path);
+        let _ = fs::remove_file(&path);
+
+        assert!(!st.is_api_error(), "error should be cleared by later reply");
+        assert!(!decide_continue(&st, "smart", &[]).should_continue);
+    }
+
+    #[test]
+    fn entrypoint_is_captured() {
+        let path = write_jsonl(&[serde_json::json!({
+            "type": "user", "uuid": "u1", "sessionId": "s3", "entrypoint": "claude-desktop",
+            "message": {"role": "user", "content": "开发"}
+        })]);
+        let st = analyze_transcript(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(st.entrypoint, "claude-desktop");
+    }
+
+    // ---- custom keywords --------------------------------------------------
+    #[test]
+    fn custom_keyword_triggers_when_no_completion() {
+        let st = state("end_turn", "我先暂停一下，等你确认。");
+        let kws = vec!["暂停".to_string()];
+        assert!(decide_continue(&st, "smart", &kws).should_continue);
+    }
+
+    #[test]
+    fn custom_keyword_ignored_when_task_complete() {
+        // Completion language wins over a keyword hit, so we don't loop forever.
+        let st = state("end_turn", "任务已完成。（这里顺便说了暂停）");
+        let kws = vec!["暂停".to_string()];
+        assert!(!decide_continue(&st, "smart", &kws).should_continue);
+    }
+
+    #[test]
+    fn custom_keyword_empty_list_is_noop() {
+        let st = state("end_turn", "随便一段话");
+        assert!(!decide_continue(&st, "smart", &[]).should_continue);
     }
 }

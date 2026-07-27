@@ -28,6 +28,17 @@ interface Config {
   prompt: string;
   check_existing: boolean;
   follow_latest: boolean;
+  custom_keywords_enabled: boolean;
+  custom_keywords: string[];
+}
+interface PairView {
+  id: string;
+  session_display: string;
+  window_label: string;
+  target_kind: string;
+  continue_count: number;
+  status: string;
+  status_kind: string;
 }
 interface InitialPayload {
   config: Config;
@@ -35,6 +46,8 @@ interface InitialPayload {
   selected_session: string;
   windows: WindowItem[];
   selected_window: string;
+  pairs: PairView[];
+  watching: boolean;
 }
 
 // ---- Element helpers ------------------------------------------------------
@@ -48,6 +61,8 @@ const statusText = $("status-text");
 const logBox = $("log-box");
 const toastEl = $("toast");
 const btnToggle = $<HTMLButtonElement>("btn-toggle");
+const pairsList = $("pairs-list");
+const pairsEmpty = $("pairs-empty");
 
 const cfgEls = {
   target: $<HTMLSelectElement>("cfg-target"),
@@ -59,6 +74,8 @@ const cfgEls = {
   prompt: $<HTMLTextAreaElement>("cfg-prompt"),
   checkExisting: $<HTMLInputElement>("cfg-check-existing"),
   followLatest: $<HTMLInputElement>("cfg-follow-latest"),
+  keywordsEnabled: $<HTMLInputElement>("cfg-keywords-enabled"),
+  keywords: $<HTMLTextAreaElement>("cfg-keywords"),
 };
 
 let watching = false;
@@ -74,6 +91,8 @@ function applyConfig(c: Config) {
   cfgEls.prompt.value = c.prompt;
   cfgEls.checkExisting.checked = c.check_existing;
   cfgEls.followLatest.checked = c.follow_latest;
+  cfgEls.keywordsEnabled.checked = c.custom_keywords_enabled;
+  cfgEls.keywords.value = (c.custom_keywords || []).join("\n");
 }
 
 function collectConfig(): Config {
@@ -91,6 +110,11 @@ function collectConfig(): Config {
     prompt: cfgEls.prompt.value,
     check_existing: cfgEls.checkExisting.checked,
     follow_latest: cfgEls.followLatest.checked,
+    custom_keywords_enabled: cfgEls.keywordsEnabled.checked,
+    custom_keywords: cfgEls.keywords.value
+      .split(/[\n,，]/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
   };
 }
 
@@ -126,6 +150,38 @@ function renderWindows(windows: WindowItem[], selected: string) {
     windowSelect.appendChild(opt);
   }
   windowSelect.value = selected || "__auto__";
+}
+
+function renderPairs(pairs: PairView[]) {
+  pairsList.innerHTML = "";
+  pairsEmpty.style.display = pairs.length === 0 ? "block" : "none";
+  for (const p of pairs) {
+    const row = document.createElement("div");
+    row.className = "pair-row";
+
+    const main = document.createElement("div");
+    main.className = "pair-main";
+    const title = document.createElement("div");
+    title.className = "pair-title";
+    title.textContent = p.session_display;
+    const meta = document.createElement("div");
+    meta.className = "pair-meta";
+    meta.textContent = `→ ${p.window_label}`;
+    main.append(title, meta);
+
+    const status = document.createElement("span");
+    status.className = "pair-status lv-" + (p.status_kind || "info");
+    const countText = p.continue_count > 0 ? `（${p.continue_count} 次）` : "";
+    status.textContent = (p.status || "待监听") + countText;
+
+    const del = document.createElement("button");
+    del.className = "btn btn-ghost pair-del";
+    del.textContent = "移除";
+    del.onclick = () => invoke("remove_pair", { id: p.id });
+
+    row.append(main, status, del);
+    pairsList.appendChild(row);
+  }
 }
 
 function setStatus(text: string, kind: string) {
@@ -233,6 +289,12 @@ function wireEvents() {
   sessionSelect.onchange = () => invoke("select_session", { path: sessionSelect.value });
   windowSelect.onchange = () => invoke("select_window", { value: windowSelect.value });
 
+  $("btn-add-pair").onclick = async () => {
+    // Persist the current client-type choice so the new pair adopts it.
+    await invoke("save_config", { config: collectConfig() });
+    await invoke("add_pair");
+  };
+
   btnToggle.onclick = async () => {
     if (watching) {
       await invoke("stop_watch", { reason: null });
@@ -282,6 +344,10 @@ async function listenBackend() {
   await listen<{ type: string; msg: string }>("toast", (e) =>
     toast(e.payload.msg, e.payload.type)
   );
+  await listen<{ pairs: PairView[]; watching: boolean }>("pairs", (e) => {
+    renderPairs(e.payload.pairs);
+    setWatching(e.payload.watching);
+  });
 }
 
 async function init() {
@@ -291,6 +357,8 @@ async function init() {
   applyConfig(data.config);
   renderSessions(data.sessions, data.selected_session);
   renderWindows(data.windows, data.selected_window);
+  renderPairs(data.pairs || []);
+  setWatching(data.watching);
 }
 
 window.addEventListener("DOMContentLoaded", init);

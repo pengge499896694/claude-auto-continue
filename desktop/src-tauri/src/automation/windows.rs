@@ -34,6 +34,10 @@ const MAX_PATH: usize = 260;
 
 const VSCODE_EXECUTABLES: &[&str] = &["code.exe", "code - insiders.exe", "codium.exe", "vscodium.exe"];
 
+// Claude Desktop, the standalone app (distinct from the VS Code extension and
+// the CLI). Ships as `claude.exe` on Windows.
+const DESKTOP_EXECUTABLES: &[&str] = &["claude.exe"];
+
 const TERMINAL_EXECUTABLES: &[&str] = &[
     "windowsterminal.exe",
     "wt.exe",
@@ -54,6 +58,8 @@ fn classify(executable: &str) -> (&'static str, &'static str) {
         .unwrap_or_default();
     if VSCODE_EXECUTABLES.contains(&name.as_str()) {
         ("vscode", "VS Code")
+    } else if DESKTOP_EXECUTABLES.contains(&name.as_str()) {
+        ("desktop", "Claude 桌面版")
     } else if TERMINAL_EXECUTABLES.contains(&name.as_str()) {
         ("terminal", "终端")
     } else {
@@ -123,8 +129,11 @@ fn is_vscode(info: &WindowItem) -> bool {
 fn is_terminal(info: &WindowItem) -> bool {
     info.kind == "terminal"
 }
+fn is_desktop(info: &WindowItem) -> bool {
+    info.kind == "desktop"
+}
 fn is_supported(info: &WindowItem) -> bool {
-    info.kind == "vscode" || info.kind == "terminal"
+    info.kind == "vscode" || info.kind == "terminal" || info.kind == "desktop"
 }
 
 pub fn foreground_window() -> Option<WindowItem> {
@@ -180,6 +189,7 @@ pub fn choose_target_window(
     let pred: fn(&WindowItem) -> bool = match target_kind {
         "vscode" => is_vscode,
         "terminal" => is_terminal,
+        "desktop" => is_desktop,
         _ => is_supported,
     };
 
@@ -354,22 +364,35 @@ fn send_via_terminal(hwnd: isize, prompt: &str) {
     send_hotkey(&[VK_RETURN]);
 }
 
+fn send_via_desktop(hwnd: isize, prompt: &str) {
+    // Claude Desktop focuses its composer when the window is activated, so we
+    // just bring it forward and type. A leading click-equivalent is unnecessary;
+    // the input box already holds focus on a normal foreground switch.
+    if !activate_window(hwnd) {
+        sleep(Duration::from_millis(200));
+    }
+    sleep(Duration::from_millis(450));
+    type_unicode(&one_line(prompt));
+    sleep(Duration::from_millis(200));
+    send_hotkey(&[VK_RETURN]);
+}
+
 pub fn send_continue_to_claude(hwnd: isize, prompt: &str, target_kind: &str) -> Result<(), String> {
-    let kind = if target_kind == "vscode" || target_kind == "terminal" {
+    let kind = if target_kind == "vscode" || target_kind == "terminal" || target_kind == "desktop" {
         target_kind.to_string()
     } else {
         get_window_info(hwnd)
             .map(|i| i.kind)
-            .filter(|k| k == "vscode" || k == "terminal")
+            .filter(|k| k == "vscode" || k == "terminal" || k == "desktop")
             .unwrap_or_else(|| "vscode".to_string())
     };
     if hwnd == 0 || unsafe { IsWindow(hwnd) } == 0 {
         return Err("目标窗口已失效".into());
     }
-    if kind == "terminal" {
-        send_via_terminal(hwnd, prompt);
-    } else {
-        send_via_vscode(hwnd, prompt);
+    match kind.as_str() {
+        "terminal" => send_via_terminal(hwnd, prompt),
+        "desktop" => send_via_desktop(hwnd, prompt),
+        _ => send_via_vscode(hwnd, prompt),
     }
     Ok(())
 }

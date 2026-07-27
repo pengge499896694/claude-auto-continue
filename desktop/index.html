@@ -40,6 +40,10 @@
               <button class="btn" id="btn-refresh-windows">刷新窗口</button>
               <button class="btn" id="btn-bind">3 秒后绑定当前窗口</button>
             </div>
+            <div class="row">
+              <button class="btn btn-primary" id="btn-add-pair">＋ 加入监听列表（会话 ↔ 窗口）</button>
+              <span class="field-label">多开时可为每个会话各绑一个窗口，逐个加入后一起监听。</span>
+            </div>
           </div>
         </section>
 
@@ -51,9 +55,10 @@
               <div class="field">
                 <label class="field-label">客户端类型</label>
                 <select id="cfg-target" class="select">
-                  <option value="auto">自动（VS Code 或终端）</option>
+                  <option value="auto">自动（VS Code / 终端 / 桌面应用）</option>
                   <option value="vscode">Claude Code（VS Code 插件）</option>
                   <option value="terminal">Claude CLI（终端）</option>
+                  <option value="desktop">Claude Desktop（独立桌面应用）</option>
                 </select>
               </div>
               <div class="field">
@@ -91,6 +96,23 @@
               <label class="switch"><input type="checkbox" id="cfg-check-existing" /><span>启动时检查当前已停止状态</span></label>
               <label class="switch"><input type="checkbox" id="cfg-follow-latest" /><span>自动跟随最新会话（多窗口时慎用）</span></label>
             </div>
+            <div class="field">
+              <label class="switch"><input type="checkbox" id="cfg-keywords-enabled" /><span>自定义关键字触发（命中且未见完成标记时续跑）</span></label>
+              <input type="text" id="cfg-keywords" class="input" placeholder="多个关键字用逗号分隔，如：已暂停, waiting for, 等待确认" />
+              <span class="field-label">开启后，除内置判断外，回复中出现这些关键字且没有完成标记时，也会触发一次续跑（用于识别异常终止/中途停下）。</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Pairs card -->
+        <section class="card">
+          <div class="card-head">
+            <span class="idx">3</span><span>监听配对</span>
+            <span class="field-label" style="margin-left:8px">多个会话可各自绑定窗口，同时监听</span>
+          </div>
+          <div class="card-body">
+            <div id="pairs-empty" class="field-label">还没有配对。在上方选好会话与目标窗口后，点“加入监听”即可添加；也可以不添加，直接点“开始监听”对当前选择进行单会话监听。</div>
+            <div id="pairs-list" class="pairs-list"></div>
           </div>
         </section>
 

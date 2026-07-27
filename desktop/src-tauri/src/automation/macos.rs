@@ -33,11 +33,16 @@ const TERMINAL_APPS: &[&str] = &[
     "Ghostty",
 ];
 
+// Claude Desktop 独立应用（macOS 上进程名为 "Claude"）。
+const DESKTOP_APPS: &[&str] = &["Claude"];
+
 fn classify(app_name: &str) -> (&'static str, &'static str) {
     if VSCODE_APPS.contains(&app_name) {
         ("vscode", "VS Code")
     } else if TERMINAL_APPS.contains(&app_name) {
         ("terminal", "终端")
+    } else if DESKTOP_APPS.contains(&app_name) {
+        ("desktop", "Claude 桌面版")
     } else {
         ("", "其它")
     }
@@ -171,7 +176,7 @@ fn to_item(p: &Proc) -> WindowItem {
 }
 
 fn is_supported_kind(kind: &str) -> bool {
-    kind == "vscode" || kind == "terminal"
+    kind == "vscode" || kind == "terminal" || kind == "desktop"
 }
 
 // --------------------------------------------------------------------------
@@ -230,6 +235,7 @@ pub fn choose_target_window(
         match target_kind {
             "vscode" => kind == "vscode",
             "terminal" => kind == "terminal",
+            "desktop" => kind == "desktop",
             _ => is_supported_kind(kind),
         }
     };
@@ -329,23 +335,39 @@ end tell"#,
     run_osascript(&script).map(|_| ())
 }
 
+// Claude Desktop 独立应用：激活后输入框获得焦点，粘贴并回车即可。
+fn send_via_desktop(pid: u32, prompt: &str) -> Result<(), String> {
+    set_clipboard(&one_line(prompt))?;
+    let script = format!(
+        r#"tell application "System Events"
+    set frontmost of (first process whose unix id is {pid}) to true
+    delay 0.5
+    keystroke "v" using {{command down}}
+    delay 0.2
+    key code 36
+end tell"#,
+        pid = pid
+    );
+    run_osascript(&script).map(|_| ())
+}
+
 pub fn send_continue_to_claude(hwnd: isize, prompt: &str, target_kind: &str) -> Result<(), String> {
     if hwnd == 0 {
         return Err("目标窗口已失效".into());
     }
     let pid = hwnd as u32;
-    let kind = if target_kind == "vscode" || target_kind == "terminal" {
+    let kind = if target_kind == "vscode" || target_kind == "terminal" || target_kind == "desktop" {
         target_kind.to_string()
     } else {
         get_window_info(hwnd)
             .map(|i| i.kind)
-            .filter(|k| k == "vscode" || k == "terminal")
+            .filter(|k| k == "vscode" || k == "terminal" || k == "desktop")
             .unwrap_or_else(|| "vscode".to_string())
     };
-    if kind == "terminal" {
-        send_via_terminal(pid, prompt)
-    } else {
-        send_via_vscode(pid, prompt)
+    match kind.as_str() {
+        "terminal" => send_via_terminal(pid, prompt),
+        "desktop" => send_via_desktop(pid, prompt),
+        _ => send_via_vscode(pid, prompt),
     }
 }
 
