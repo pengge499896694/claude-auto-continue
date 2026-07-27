@@ -22,28 +22,33 @@ fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
+// Signals that the turn stopped *mid-task*. Kept deliberately strong: pure
+// narration words like "接下来 / 下一步 / next steps" were removed because they
+// appear constantly in normal, finished replies ("任务完成。接下来你可以…") and
+// caused false continues. These are matched against the tail of the reply only
+// (see `tail_for_signals`) so a mention early in a long, otherwise-finished
+// answer does not trigger a continue.
 const UNFINISHED_PATTERNS: &[&str] = &[
     "尚未完成",
     "还没完成",
+    "还未完成",
     "仍未完成",
     "需要继续",
     "继续完成",
-    "接下来(?:需要|将|我会)",
-    "下一步(?:是|需要|将)",
-    "剩余(?:工作|任务|步骤|问题)",
-    "还需要",
-    "后续还要",
-    "我将继续",
     "未能完成",
     "待完成",
+    "我(?:会|将)继续",
+    "让我继续",
+    "现在继续",
+    "剩余(?:的)?(?:工作|任务|步骤|部分)尚",
     "TODO",
     "not (?:yet )?(?:finished|complete)",
     "still need(?:s)? to",
     "need(?:s)? to continue",
     "I(?:'|’)ll continue",
     "I will continue",
-    "remaining (?:work|tasks?|steps?)",
-    "next steps? (?:are|is|include)",
+    "let me continue",
+    "continuing",
 ];
 
 const COMPLETION_PATTERNS: &[&str] = &[
@@ -77,6 +82,18 @@ fn compile(patterns: &[&str]) -> Vec<Regex> {
 
 fn matches_any(text: &str, res: &[Regex]) -> bool {
     res.iter().any(|re| re.is_match(text))
+}
+
+/// The trailing portion of a reply, used for "unfinished" detection so that a
+/// mid-reply narrative phrase (e.g. "接下来我来实现…") doesn't count once the
+/// turn actually ends with a completion statement. Returns roughly the last
+/// `chars` characters, snapped to a char boundary.
+fn tail_text(text: &str, chars: usize) -> String {
+    let all: Vec<char> = text.chars().collect();
+    if all.len() <= chars {
+        return text.to_string();
+    }
+    all[all.len() - chars..].iter().collect()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -507,7 +524,12 @@ pub fn decide_continue(state: &TurnState, mode: &str, custom_keywords: &[String]
     }
 
     let text = state.assistant_text.trim();
-    let unfinished = matches_any(text, &UNFINISHED_RE);
+    // "Unfinished" signals only count when they appear near the END of the
+    // reply. A mid-narration "接下来我来改 X" followed by a wrap-up should not
+    // trigger a continue — what matters is how the reply actually ends.
+    let tail = tail_text(text, 160);
+    let unfinished = matches_any(&tail, &UNFINISHED_RE);
+    // Completion markers are checked against the whole reply.
     let complete = matches_any(text, &COMPLETION_RE);
 
     // Custom keywords work in every mode: if one matches and the reply does not
@@ -530,10 +552,18 @@ pub fn decide_continue(state: &TurnState, mode: &str, custom_keywords: &[String]
     }
 
     if mode == "smart" {
+        // A completion claim wins over a stray unfinished phrase: if the reply
+        // says it's done, don't continue even if some earlier wording matched.
+        if complete {
+            return ContinueDecision {
+                should_continue: false,
+                reason: "回复包含完成标记/完成语句".into(),
+            };
+        }
         if unfinished {
             return ContinueDecision {
                 should_continue: true,
-                reason: "回复明确表示仍有未完成工作".into(),
+                reason: "回复结尾明确表示仍有未完成工作".into(),
             };
         }
         if state.has_unclosed_code_fence {
@@ -630,6 +660,35 @@ mod tests {
         assert!(decide_continue(&st, "strict", &[]).should_continue);
         let done = state("end_turn", "全部完成 [[AUTO_CONTINUE_DONE]]");
         assert!(!decide_continue(&done, "strict", &[]).should_continue);
+    }
+
+    #[test]
+    fn smart_completion_claim_beats_stray_unfinished_word() {
+        // A reply that narrates "接下来" mid-way but ends with a completion claim
+        // must NOT trigger a continue (the old logic wrongly did).
+        let st = state(
+            "end_turn",
+            "我先改了 A，接下来又改了 B。全部完成，测试已通过。",
+        );
+        assert!(!decide_continue(&st, "smart", &[]).should_continue);
+    }
+
+    #[test]
+    fn smart_ignores_midtext_narration_when_tail_is_a_wrapup() {
+        // "接下来" appears only in the middle; the reply ends on a neutral wrap-up
+        // with no trailing unfinished signal -> should not continue.
+        let long_middle = "接下来我会实现这个功能。".to_string()
+            + &"这里是一大段实现说明和代码解释，用于把前面的叙述推离结尾。".repeat(6);
+        let text = format!("{}\n以上就是本次改动的说明。", long_middle);
+        let st = state("end_turn", &text);
+        assert!(!decide_continue(&st, "smart", &[]).should_continue);
+    }
+
+    #[test]
+    fn smart_continues_when_tail_says_unfinished() {
+        // Unfinished signal genuinely at the end -> continue.
+        let st = state("end_turn", "我已经改好了第一部分，尚未完成剩余的部分。");
+        assert!(decide_continue(&st, "smart", &[]).should_continue);
     }
 
     // ---- transcript parsing on a real temp .jsonl file --------------------

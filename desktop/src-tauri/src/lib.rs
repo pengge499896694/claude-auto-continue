@@ -843,10 +843,24 @@ fn do_send_for_pair(app: &AppHandle, state: &AppState, pair_id: &str, reason: &s
     let ptr = (state as *const AppState) as usize;
     let (hwnd, tkind, kind_label) = (target.hwnd, target.kind.clone(), target.kind_label.clone());
     let pid = pair_id.to_string();
+    // Session file mtime just before sending; used to verify the prompt really
+    // landed (Claude writes a new message → the file changes shortly after).
+    let session_path = PathBuf::from(&pid);
+    let mtime_before = file_mtime(&session_path);
     std::thread::spawn(move || {
         let result = send_continue_to_claude(hwnd, &prompt, &tkind);
         // Safe: AppState lives for the whole app lifetime (managed by Tauri).
         let state: &AppState = unsafe { &*(ptr as *const AppState) };
+
+        // On a successful key-injection, confirm delivery by watching the
+        // session file for a change over the next few seconds. A change means
+        // Claude actually received the prompt and started a new turn.
+        let delivered = if result.is_ok() {
+            wait_for_session_change(&session_path, mtime_before, 6.0)
+        } else {
+            false
+        };
+
         let mut watch = state.watch.lock().unwrap();
         if let Some(p) = watch.pairs.iter_mut().find(|p| p.id() == pid) {
             p.sending = false;
@@ -863,9 +877,21 @@ fn do_send_for_pair(app: &AppHandle, state: &AppState, pair_id: &str, reason: &s
                 Ok(()) => {
                     p.last_send_at = now_secs();
                     p.sending_fingerprint.clear();
-                    p.continue_count += 1;
-                    p.status = format!("已发送续跑（第 {} 次）", p.continue_count);
-                    p.status_kind = "run".into();
+                    if delivered {
+                        p.continue_count += 1;
+                        p.status = format!("已确认送达（第 {} 次续跑）", p.continue_count);
+                        p.status_kind = "run".into();
+                    } else {
+                        // The keys were injected but the session did not change.
+                        // Release the fingerprint so the next tick can retry, and
+                        // do NOT count it as a real continue.
+                        let fp = p.sending_fingerprint.clone();
+                        if !fp.is_empty() {
+                            p.handled.remove(&fp);
+                        }
+                        p.status = "已执行发送动作，但未检测到会话更新".into();
+                        p.status_kind = "warn".into();
+                    }
                 }
             }
         }
@@ -873,18 +899,52 @@ fn do_send_for_pair(app: &AppHandle, state: &AppState, pair_id: &str, reason: &s
         match result {
             Err(e) => emit_log(&app2, &format!("[{}] 发送失败：{}", short_id(&pid), e), "err"),
             Ok(()) => {
-                let how = if kind_label == "终端" {
-                    "已切换到终端并输入续跑提示词"
-                } else if kind_label == "Claude 桌面应用" {
-                    "已切换到 Claude 桌面应用并输入续跑提示词"
+                if delivered {
+                    let how = if kind_label == "终端" {
+                        "已切换到终端并输入续跑提示词，已确认会话更新"
+                    } else if kind_label == "Claude 桌面应用" {
+                        "已切换到 Claude 桌面应用并输入续跑提示词，已确认会话更新"
+                    } else {
+                        "已通过命令面板聚焦输入框并发送续跑提示词，已确认会话更新"
+                    };
+                    emit_log(&app2, &format!("[{}] {}。", short_id(&pid), how), "ok");
                 } else {
-                    "已通过命令面板聚焦输入框并发送续跑提示词"
-                };
-                emit_log(&app2, &format!("[{}] {}。", short_id(&pid), how), "ok");
+                    emit_log(
+                        &app2,
+                        &format!(
+                            "[{}] 已执行发送动作，但 6 秒内未检测到会话更新——提示词可能未真正进入输入框（请检查目标窗口/命令名是否正确）。稍后会重试。",
+                            short_id(&pid)
+                        ),
+                        "warn",
+                    );
+                }
             }
         }
         emit_pairs(&app2, state);
     });
+}
+
+/// The session file's mtime as a float epoch, or 0.0 if unavailable.
+fn file_mtime(path: &std::path::Path) -> f64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Poll the session file for up to `timeout` seconds, returning true as soon as
+/// its mtime advances past `baseline` — evidence the prompt actually landed.
+fn wait_for_session_change(path: &std::path::Path, baseline: f64, timeout: f64) -> bool {
+    let deadline = now_secs() + timeout;
+    while now_secs() < deadline {
+        std::thread::sleep(Duration::from_millis(400));
+        if file_mtime(path) > baseline + 0.001 {
+            return true;
+        }
+    }
+    false
 }
 
 fn short_id(id: &str) -> String {
