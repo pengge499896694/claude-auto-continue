@@ -80,6 +80,10 @@ ClaudeAutoContinue_*_x64_en-US.msi   （MSI 安装包，适合企业部署）
 
 默认续跑提示词已包含一句：**“如果确认已全部完成，请在回复最后单独输出一行 `[[AUTO_CONTINUE_DONE]]`。”** 一旦 Claude 输出该标记，完成检测即判定任务结束，不再续跑。这样即便在严格 / 断流场景下，也有一个明确的“得到肯定答案后停止”的终止条件。
 
+## 确认完成模式（可选，任何判断模式下都生效）
+
+在“监听设置”里打开“确认完成模式”后：**只要回合正常停止且回复没有明确表示任务完成，就会追问一次“是否已完成”，直到回复明确确认完成（出现完成标记/完成语句且结尾没有未完成措辞）才停。** 不区分智能 / 严格模式，也不依赖具体模型的措辞——最可靠的收尾方式是让续跑提示词要求“完成时输出 `[[AUTO_CONTINUE_DONE]]`”。异常情况（API 错误 / 截断 / 断流）仍按各自规则续跑。追问次数受“最大续跑次数”上限兜底，不会无限循环。
+
 ## 自定义关键字触发（可选）
 
 在“监听设置”里打开“自定义关键字触发”，填入若干关键字（逗号或换行分隔，如 `已暂停, waiting for, 等待确认`）。开启后，只要回复中命中任一关键字且没有出现完成标记，就判定为“任务未真正完成”，触发一次续跑。用于捕捉内置规则识别不到的异常终止 / 中途停下场景。
@@ -129,6 +133,18 @@ ClaudeAutoContinue_*_x64_en-US.msi   （MSI 安装包，适合企业部署）
 Windows: %APPDATA%\ClaudeAutoContinue\config.json / monitor.log
 macOS:   ~/Library/Application Support/ClaudeAutoContinue/config.json / monitor.log
 ```
+
+## 自动更新
+
+应用内置了 Tauri 官方更新器：控制区的“检查更新”按钮会查询 GitHub Releases 的最新版本，发现新版时用应用内弹窗提示，确认后自动下载、安装并重启。启动约 3 秒后也会静默检查一次（无新版时不打扰）。
+
+更新包由一对 ed25519 密钥签名，防止被篡改：
+
+- 公钥写在 `desktop/src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`。
+- 私钥存为仓库的 **Repository secret** `TAURI_SIGNING_PRIVATE_KEY`（不进仓库；`updater_key` 已在 `.gitignore` 中）。
+- CI 打包时用私钥签名，并生成随 Release 一起发布的 `latest.json` 更新清单；`tauri.conf.json` 的 `updater.endpoints` 指向该清单。
+
+注意：这套更新签名与操作系统的代码签名（SmartScreen / Gatekeeper）是两回事，只用于校验更新包完整性，不消除首次安装时的系统拦截提示。验证自动更新需要至少两个版本：先装一个较低版本，再发布一个更高版本，低版本才能检测并升级到它。
 
 ## 项目结构与技术栈
 
