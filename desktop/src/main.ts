@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 
 // ---- Types matching the Rust payloads -------------------------------------
 interface SessionItem {
@@ -31,6 +33,7 @@ interface Config {
   custom_keywords_enabled: boolean;
   custom_keywords: string[];
   heartbeat_log_enabled: boolean;
+  confirm_completion: boolean;
 }
 interface PairView {
   id: string;
@@ -78,6 +81,7 @@ const cfgEls = {
   keywordsEnabled: $<HTMLInputElement>("cfg-keywords-enabled"),
   keywords: $<HTMLTextAreaElement>("cfg-keywords"),
   heartbeat: $<HTMLInputElement>("cfg-heartbeat"),
+  confirmCompletion: $<HTMLInputElement>("cfg-confirm-completion"),
 };
 
 let watching = false;
@@ -96,6 +100,7 @@ function applyConfig(c: Config) {
   cfgEls.keywordsEnabled.checked = c.custom_keywords_enabled;
   cfgEls.keywords.value = (c.custom_keywords || []).join("\n");
   cfgEls.heartbeat.checked = c.heartbeat_log_enabled;
+  cfgEls.confirmCompletion.checked = c.confirm_completion;
 }
 
 function collectConfig(): Config {
@@ -119,6 +124,7 @@ function collectConfig(): Config {
       .map((s) => s.trim())
       .filter((s) => s.length > 0),
     heartbeat_log_enabled: cfgEls.heartbeat.checked,
+    confirm_completion: cfgEls.confirmCompletion.checked,
   };
 }
 
@@ -354,6 +360,64 @@ async function listenBackend() {
   });
 }
 
+// ---- Auto update ----------------------------------------------------------
+// Checks GitHub Releases for a newer signed build. On finding one, asks the
+// user with the in-app dialog, then downloads + installs and relaunches.
+// `silent` suppresses the "already latest / check failed" toasts (used on the
+// automatic startup check, so it never nags when there's nothing to do).
+async function checkForUpdates(silent: boolean) {
+  let update;
+  try {
+    update = await check();
+  } catch (e) {
+    if (!silent) toast("检查更新失败：" + e, "error");
+    return;
+  }
+  if (!update) {
+    if (!silent) toast("当前已是最新版本", "success");
+    return;
+  }
+
+  const notes = (update.body || "").trim();
+  const ok = await confirmDialog(
+    `发现新版本 ${update.version}（当前 ${update.currentVersion}）。\n\n` +
+      (notes ? notes + "\n\n" : "") +
+      "是否现在下载并安装？安装完成后程序会自动重启。",
+    { title: "发现新版本", okText: "立即更新", cancelText: "以后再说" }
+  );
+  if (!ok) return;
+
+  try {
+    toast("正在下载更新…", "info");
+    setStatus("正在下载更新…", "info");
+    let downloaded = 0;
+    let total = 0;
+    await update.downloadAndInstall((ev) => {
+      if (ev.event === "Started") {
+        total = ev.data.contentLength ?? 0;
+      } else if (ev.event === "Progress") {
+        downloaded += ev.data.chunkLength ?? 0;
+        if (total > 0) {
+          const pct = Math.round((downloaded / total) * 100);
+          setStatus(`下载更新中… ${pct}%`, "info");
+        }
+      } else if (ev.event === "Finished") {
+        setStatus("更新下载完成，准备安装…", "info");
+      }
+    });
+    await confirmDialog("更新已安装，点击“重启”以使用新版本。", {
+      title: "更新完成",
+      okText: "重启",
+      cancelText: "稍后",
+    }).then((doRestart) => {
+      if (doRestart) return relaunch();
+    });
+  } catch (e) {
+    toast("更新失败：" + e, "error");
+    setStatus("更新失败", "err");
+  }
+}
+
 async function init() {
   wireEvents();
   await listenBackend();
@@ -363,6 +427,13 @@ async function init() {
   renderWindows(data.windows, data.selected_window);
   renderPairs(data.pairs || []);
   setWatching(data.watching);
+
+  // Manual "check for updates" button.
+  const btnUpdate = document.getElementById("btn-update");
+  if (btnUpdate) btnUpdate.onclick = () => checkForUpdates(false);
+
+  // Silent check shortly after startup so it never blocks first paint.
+  setTimeout(() => checkForUpdates(true), 3000);
 }
 
 window.addEventListener("DOMContentLoaded", init);

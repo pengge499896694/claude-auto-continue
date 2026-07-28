@@ -9,7 +9,12 @@ use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HGLOBAL, HWND, LPARAM};
+use windows_sys::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
 use windows_sys::Win32::System::Threading::{
     AttachThreadInput, GetCurrentThreadId, GetExitCodeProcess, OpenProcess,
     QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -18,7 +23,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, SetActiveWindow, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_P, VK_RETURN, VK_SHIFT,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_P, VK_RETURN, VK_SHIFT, VK_V,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -241,7 +246,8 @@ pub fn is_process_running(pid: u32) -> bool {
     }
 }
 
-fn activate_window(hwnd: isize) -> bool {
+/// Try once to bring `hwnd` to the foreground using the AttachThreadInput trick.
+fn try_foreground(hwnd: isize) -> bool {
     unsafe {
         if IsWindow(hwnd) == 0 {
             return false;
@@ -281,9 +287,25 @@ fn activate_window(hwnd: isize) -> bool {
             AttachThreadInput(current_thread, target_thread, 0);
         }
 
-        sleep(Duration::from_millis(250));
+        sleep(Duration::from_millis(120));
         GetForegroundWindow() == hwnd
     }
+}
+
+/// Bring the target window to the foreground, retrying a few times. Returns true
+/// only once the window is confirmed frontmost, so callers can refuse to send
+/// keystrokes into the wrong window.
+fn activate_window(hwnd: isize) -> bool {
+    for attempt in 0..5 {
+        if try_foreground(hwnd) {
+            // Give the window a moment to settle its focus before typing.
+            sleep(Duration::from_millis(180));
+            return true;
+        }
+        sleep(Duration::from_millis(120 * (attempt + 1)));
+    }
+    // One last check: it may have become foreground despite the race.
+    unsafe { GetForegroundWindow() == hwnd }
 }
 
 fn keybd_input(vk: VIRTUAL_KEY, scan: u16, flags: u32) -> INPUT {
@@ -329,6 +351,61 @@ fn type_unicode(text: &str) {
     }
 }
 
+/// Put UTF-16 text on the system clipboard. Returns false on any failure.
+///
+/// Electron apps (VS Code) and many terminals drop fast synthesized Unicode
+/// keystrokes — especially non-ASCII — so we paste instead of typing the prompt.
+fn set_clipboard_text(text: &str) -> bool {
+    let mut utf16: Vec<u16> = text.encode_utf16().collect();
+    utf16.push(0); // null terminator
+    let bytes = utf16.len() * std::mem::size_of::<u16>();
+    unsafe {
+        // Try to open the clipboard a few times; another app may hold it briefly.
+        let mut opened = false;
+        for _ in 0..10 {
+            if OpenClipboard(0) != 0 {
+                opened = true;
+                break;
+            }
+            sleep(Duration::from_millis(30));
+        }
+        if !opened {
+            return false;
+        }
+        if EmptyClipboard() == 0 {
+            CloseClipboard();
+            return false;
+        }
+        let hmem: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if hmem.is_null() {
+            CloseClipboard();
+            return false;
+        }
+        let dst = GlobalLock(hmem) as *mut u16;
+        if dst.is_null() {
+            CloseClipboard();
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
+        GlobalUnlock(hmem);
+        // Ownership of hmem transfers to the clipboard on success.
+        let set = SetClipboardData(CF_UNICODETEXT as u32, hmem as HANDLE);
+        CloseClipboard();
+        set != 0
+    }
+}
+
+/// Paste the given text by placing it on the clipboard and sending Ctrl+V.
+/// Returns false if the clipboard could not be populated (caller can fall back).
+fn paste_text(text: &str) -> bool {
+    if !set_clipboard_text(text) {
+        return false;
+    }
+    sleep(Duration::from_millis(60));
+    send_hotkey(&[VK_CONTROL, VK_V]);
+    true
+}
+
 fn one_line(prompt: &str) -> String {
     prompt
         .replace('\r', "\n")
@@ -339,42 +416,52 @@ fn one_line(prompt: &str) -> String {
         .to_string()
 }
 
-fn send_via_vscode(hwnd: isize, prompt: &str) {
-    if !activate_window(hwnd) {
-        sleep(Duration::from_millis(200));
+// Deliver the prompt text into whatever input box currently has focus:
+// clipboard + Ctrl+V (reliable for Electron apps like VS Code, and for CJK
+// text, which raw KEYEVENTF_UNICODE keystrokes drop). Falls back to typing.
+fn deliver_prompt(prompt: &str) {
+    let text = one_line(prompt);
+    if !paste_text(&text) {
+        // Clipboard failed; last-resort keystrokes (may be lossy for CJK).
+        type_unicode(&text);
     }
-    send_hotkey(&[VK_CONTROL, VK_SHIFT, VK_P]);
-    sleep(Duration::from_millis(450));
-    type_unicode("Claude Code: Focus input");
-    sleep(Duration::from_millis(350));
-    send_hotkey(&[VK_RETURN]);
-    sleep(Duration::from_millis(650));
-    type_unicode(&one_line(prompt));
     sleep(Duration::from_millis(150));
     send_hotkey(&[VK_RETURN]);
 }
 
-fn send_via_terminal(hwnd: isize, prompt: &str) {
+fn send_via_vscode(hwnd: isize, prompt: &str) -> Result<(), String> {
+    // Refuse to fire keys into the wrong window: activation must succeed.
     if !activate_window(hwnd) {
-        sleep(Duration::from_millis(200));
+        return Err("无法将 VS Code 窗口切到前台（可能被其它全屏窗口挡住或系统拒绝夺取焦点）".into());
     }
+    send_hotkey(&[VK_CONTROL, VK_SHIFT, VK_P]);
+    sleep(Duration::from_millis(500));
+    // Command name is ASCII, so keystrokes are safe and reliable here.
+    type_unicode("Claude Code: Focus input");
     sleep(Duration::from_millis(400));
-    type_unicode(&one_line(prompt));
-    sleep(Duration::from_millis(200));
     send_hotkey(&[VK_RETURN]);
+    sleep(Duration::from_millis(700));
+    deliver_prompt(prompt);
+    Ok(())
 }
 
-fn send_via_desktop(hwnd: isize, prompt: &str) {
-    // Claude Desktop focuses its composer when the window is activated, so we
-    // just bring it forward and type. A leading click-equivalent is unnecessary;
-    // the input box already holds focus on a normal foreground switch.
+fn send_via_terminal(hwnd: isize, prompt: &str) -> Result<(), String> {
     if !activate_window(hwnd) {
-        sleep(Duration::from_millis(200));
+        return Err("无法将终端窗口切到前台".into());
+    }
+    sleep(Duration::from_millis(400));
+    deliver_prompt(prompt);
+    Ok(())
+}
+
+fn send_via_desktop(hwnd: isize, prompt: &str) -> Result<(), String> {
+    // Claude Desktop focuses its composer when the window is activated.
+    if !activate_window(hwnd) {
+        return Err("无法将 Claude 桌面应用窗口切到前台".into());
     }
     sleep(Duration::from_millis(450));
-    type_unicode(&one_line(prompt));
-    sleep(Duration::from_millis(200));
-    send_hotkey(&[VK_RETURN]);
+    deliver_prompt(prompt);
+    Ok(())
 }
 
 pub fn send_continue_to_claude(hwnd: isize, prompt: &str, target_kind: &str) -> Result<(), String> {
@@ -394,7 +481,6 @@ pub fn send_continue_to_claude(hwnd: isize, prompt: &str, target_kind: &str) -> 
         "desktop" => send_via_desktop(hwnd, prompt),
         _ => send_via_vscode(hwnd, prompt),
     }
-    Ok(())
 }
 
 pub fn open_path(path: &Path) -> Result<(), String> {

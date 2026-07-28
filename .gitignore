@@ -35,3 +35,6 @@ Thumbs.db
 
 # ---- Claude Code local tooling config ----
 .claude/
+
+# 更新签名私钥（绝不提交；仅存 GitHub Secret）
+desktop/src-tauri/updater_key

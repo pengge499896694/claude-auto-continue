@@ -1,12 +1,18 @@
 name: Release
 
-# 打一个 v 开头的 tag（例如 v1.0.0）时，自动编译 Windows 与 macOS 安装包并发布到同一个 GitHub Release。
+# 触发方式一：推送 v 开头的 tag（例如 v1.3.0）→ 自动编译三平台安装包并发布到该 tag 的 Release。
+# 触发方式二：在 Actions 页面手动触发（workflow_dispatch）并填入一个已存在的旧 tag → 用当前最新的
+#   工作流逻辑，但检出该旧 tag 的代码来编译，产物按旧版本号命名并发布到对应 Release（追溯重建）。
 on:
   push:
     tags:
       - "v*"
-  # 也允许在 Actions 页面手动触发（用于测试）。
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "要追溯重建的已存在 tag（如 v1.1.0）。留空则用当前分支最新代码。"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -32,8 +38,33 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - name: 检出代码
+      # 决定要构建/发布的 tag：手动触发时用输入的 tag，否则用推送的 tag。
+      - name: 计算目标 tag
+        id: target
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "ref=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 检出代码（追溯重建时检出旧 tag）
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+
+      # 关键：把 tag 名（去掉前缀 v）注入 tauri.conf.json 的 version，
+      # 这样安装包文件名会带上正确的版本号，而不是写死的 1.0.0。
+      # 追溯重建旧 tag 时用的是旧代码，但版本号仍按该 tag 正确命名。
+      - name: 注入版本号
+        shell: bash
+        run: |
+          RAW="${{ steps.target.outputs.ref }}"
+          VERSION="${RAW#v}"
+          echo "将版本号写入配置：$VERSION"
+          CONF="desktop/src-tauri/tauri.conf.json"
+          node -e "const fs=require('fs');const p='$CONF';const c=JSON.parse(fs.readFileSync(p,'utf8'));c.version='$VERSION';fs.writeFileSync(p,JSON.stringify(c,null,2));console.log('version =',c.version);"
 
       - name: 安装 Rust (${{ matrix.rust_target }})
         uses: dtolnay/rust-toolchain@stable
@@ -50,23 +81,25 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: desktop/package-lock.json
 
       - name: 安装前端依赖
         working-directory: desktop
-        run: npm ci
+        run: npm install
 
       - name: 编译并发布（Tauri）
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 更新签名：CI 用私钥对更新产物签名并生成 latest.json（自动更新校验用）。
+          # 私钥存在仓库 Secret TAURI_SIGNING_PRIVATE_KEY 中；密码为空。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
           projectPath: desktop
           args: ${{ matrix.args }}
-          # 所有平台的产物都发布到同一个以 tag 命名的 Release。
-          tagName: ${{ github.ref_name }}
-          releaseName: "Claude 自动续跑监听器 ${{ github.ref_name }}"
+          # 产物发布到以目标 tag 命名的 Release（追溯重建时即旧 tag 的 Release）。
+          tagName: ${{ steps.target.outputs.ref }}
+          releaseName: "Claude 自动续跑监听器 ${{ steps.target.outputs.ref }}"
           releaseBody: |
             ## 下载安装
 

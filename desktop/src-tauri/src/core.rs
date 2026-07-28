@@ -508,11 +508,29 @@ pub fn custom_keyword_hit(text: &str, keywords: &[String]) -> Option<String> {
     None
 }
 
+/// True when the reply clearly claims the whole task is done. Used by
+/// "confirm completion" mode to decide when to STOP asking.
+pub fn looks_complete(state: &TurnState) -> bool {
+    let text = state.assistant_text.trim();
+    let tail = tail_text(text, 160);
+    matches_any(text, &COMPLETION_RE) && !matches_any(&tail, &UNFINISHED_RE)
+}
+
 /// Decide whether a stopped/failed turn should receive a continue prompt.
 ///
 /// `custom_keywords` are extra user-defined "not done" signals; pass an empty
 /// slice when the feature is disabled.
-pub fn decide_continue(state: &TurnState, mode: &str, custom_keywords: &[String]) -> ContinueDecision {
+///
+/// `confirm_completion`: when true, ANY normally-stopped turn (in every mode)
+/// keeps getting a continue prompt until the reply clearly says it is done
+/// (a completion marker/phrase with no trailing "unfinished" signal). This is
+/// how the user gets "ask until it confirms it's finished" behavior.
+pub fn decide_continue(
+    state: &TurnState,
+    mode: &str,
+    custom_keywords: &[String],
+    confirm_completion: bool,
+) -> ContinueDecision {
     // An unrecovered API error (502/524/429/connection error/overloaded ...) is
     // an abnormal termination the user explicitly wants retried, in every mode.
     if state.is_api_error() {
@@ -560,6 +578,23 @@ pub fn decide_continue(state: &TurnState, mode: &str, custom_keywords: &[String]
     let unfinished = matches_any(&tail, &UNFINISHED_RE);
     // Completion markers are checked against the whole reply.
     let complete = matches_any(text, &COMPLETION_RE);
+
+    // "Confirm completion" overrides the per-mode logic in EVERY mode: keep
+    // asking until the reply clearly declares the task done. A stray unfinished
+    // phrase at the tail also forces another round even if a completion word
+    // appeared earlier, so a genuine "done" claim is required to stop.
+    if confirm_completion {
+        if complete && !unfinished {
+            return ContinueDecision {
+                should_continue: false,
+                reason: "确认完成模式：回复已明确表示任务完成".into(),
+            };
+        }
+        return ContinueDecision {
+            should_continue: true,
+            reason: "确认完成模式：尚未确认任务完成，追问是否已完成".into(),
+        };
+    }
 
     // Custom keywords work in every mode: if one matches and the reply does not
     // clearly claim completion, treat the task as unfinished and continue.
@@ -645,42 +680,42 @@ mod tests {
     fn max_tokens_always_continues() {
         // Even safe mode must continue on a hard length truncation.
         let st = state("max_tokens", "正在实现");
-        assert!(decide_continue(&st, "safe", &[]).should_continue);
-        assert!(decide_continue(&st, "smart", &[]).should_continue);
-        assert!(decide_continue(&st, "strict", &[]).should_continue);
+        assert!(decide_continue(&st, "safe", &[], false).should_continue);
+        assert!(decide_continue(&st, "smart", &[], false).should_continue);
+        assert!(decide_continue(&st, "strict", &[], false).should_continue);
     }
 
     #[test]
     fn smart_continues_on_explicit_unfinished() {
         let st = state("end_turn", "还需要继续完成剩余工作。");
-        assert!(decide_continue(&st, "smart", &[]).should_continue);
+        assert!(decide_continue(&st, "smart", &[], false).should_continue);
     }
 
     #[test]
     fn smart_stops_on_normal_completion() {
         let st = state("end_turn", "任务已完成，测试已通过。");
-        assert!(!decide_continue(&st, "smart", &[]).should_continue);
-        assert!(!decide_continue(&st, "strict", &[]).should_continue);
+        assert!(!decide_continue(&st, "smart", &[], false).should_continue);
+        assert!(!decide_continue(&st, "strict", &[], false).should_continue);
     }
 
     #[test]
     fn safe_ignores_plain_end_turn() {
         let st = state("end_turn", "还需要继续");
-        assert!(!decide_continue(&st, "safe", &[]).should_continue);
+        assert!(!decide_continue(&st, "safe", &[], false).should_continue);
     }
 
     #[test]
     fn unclosed_code_fence_continues_in_smart() {
         let st = state("end_turn", "```python\nprint('x')");
         assert!(st.has_unclosed_code_fence);
-        assert!(decide_continue(&st, "smart", &[]).should_continue);
+        assert!(decide_continue(&st, "smart", &[], false).should_continue);
     }
 
     #[test]
     fn tool_use_is_not_terminal() {
         let st = state("tool_use", "");
         assert!(!st.is_terminal());
-        assert!(!decide_continue(&st, "smart", &[]).should_continue);
+        assert!(!decide_continue(&st, "smart", &[], false).should_continue);
     }
 
     #[test]
@@ -695,9 +730,9 @@ mod tests {
             ..Default::default()
         };
         assert!(st.is_broken_stream());
-        assert!(decide_continue(&st, "safe", &[]).should_continue);
-        assert!(decide_continue(&st, "smart", &[]).should_continue);
-        assert!(decide_continue(&st, "strict", &[]).should_continue);
+        assert!(decide_continue(&st, "safe", &[], false).should_continue);
+        assert!(decide_continue(&st, "smart", &[], false).should_continue);
+        assert!(decide_continue(&st, "strict", &[], false).should_continue);
     }
 
     #[test]
@@ -722,9 +757,9 @@ mod tests {
     #[test]
     fn strict_continues_until_completion_marker() {
         let st = state("end_turn", "这一步做完了，我先看看。");
-        assert!(decide_continue(&st, "strict", &[]).should_continue);
+        assert!(decide_continue(&st, "strict", &[], false).should_continue);
         let done = state("end_turn", "全部完成 [[AUTO_CONTINUE_DONE]]");
-        assert!(!decide_continue(&done, "strict", &[]).should_continue);
+        assert!(!decide_continue(&done, "strict", &[], false).should_continue);
     }
 
     #[test]
@@ -735,7 +770,7 @@ mod tests {
             "end_turn",
             "我先改了 A，接下来又改了 B。全部完成，测试已通过。",
         );
-        assert!(!decide_continue(&st, "smart", &[]).should_continue);
+        assert!(!decide_continue(&st, "smart", &[], false).should_continue);
     }
 
     #[test]
@@ -746,14 +781,14 @@ mod tests {
             + &"这里是一大段实现说明和代码解释，用于把前面的叙述推离结尾。".repeat(6);
         let text = format!("{}\n以上就是本次改动的说明。", long_middle);
         let st = state("end_turn", &text);
-        assert!(!decide_continue(&st, "smart", &[]).should_continue);
+        assert!(!decide_continue(&st, "smart", &[], false).should_continue);
     }
 
     #[test]
     fn smart_continues_when_tail_says_unfinished() {
         // Unfinished signal genuinely at the end -> continue.
         let st = state("end_turn", "我已经改好了第一部分，尚未完成剩余的部分。");
-        assert!(decide_continue(&st, "smart", &[]).should_continue);
+        assert!(decide_continue(&st, "smart", &[], false).should_continue);
     }
 
     // ---- transcript parsing on a real temp .jsonl file --------------------
@@ -802,7 +837,7 @@ mod tests {
         assert_eq!(st.cwd, "E:\\demo");
         assert!(st.assistant_text.contains("剩余工作"));
         assert!(!st.fingerprint.is_empty());
-        assert!(decide_continue(&st, "smart", &[]).should_continue);
+        assert!(decide_continue(&st, "smart", &[], false).should_continue);
     }
 
     #[test]
@@ -825,7 +860,7 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         assert_eq!(st.stop_reason.as_deref(), Some("max_tokens"));
-        assert!(decide_continue(&st, "safe", &[]).should_continue);
+        assert!(decide_continue(&st, "safe", &[], false).should_continue);
     }
 
     #[test]
@@ -860,7 +895,7 @@ mod tests {
         assert!(st.is_api_error());
         assert!(st.last_error.contains("502"));
         for mode in ["safe", "smart", "strict"] {
-            assert!(decide_continue(&st, mode, &[]).should_continue, "mode={mode}");
+            assert!(decide_continue(&st, mode, &[], false).should_continue, "mode={mode}");
         }
     }
 
@@ -886,7 +921,7 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         assert!(!st.is_api_error(), "error should be cleared by later reply");
-        assert!(!decide_continue(&st, "smart", &[]).should_continue);
+        assert!(!decide_continue(&st, "smart", &[], false).should_continue);
     }
 
     #[test]
@@ -905,7 +940,7 @@ mod tests {
     fn custom_keyword_triggers_when_no_completion() {
         let st = state("end_turn", "我先暂停一下，等你确认。");
         let kws = vec!["暂停".to_string()];
-        assert!(decide_continue(&st, "smart", &kws).should_continue);
+        assert!(decide_continue(&st, "smart", &kws, false).should_continue);
     }
 
     #[test]
@@ -913,12 +948,62 @@ mod tests {
         // Completion language wins over a keyword hit, so we don't loop forever.
         let st = state("end_turn", "任务已完成。（这里顺便说了暂停）");
         let kws = vec!["暂停".to_string()];
-        assert!(!decide_continue(&st, "smart", &kws).should_continue);
+        assert!(!decide_continue(&st, "smart", &kws, false).should_continue);
     }
 
     #[test]
     fn custom_keyword_empty_list_is_noop() {
         let st = state("end_turn", "随便一段话");
-        assert!(!decide_continue(&st, "smart", &[]).should_continue);
+        assert!(!decide_continue(&st, "smart", &[], false).should_continue);
+    }
+
+    // ---- confirm-completion mode ------------------------------------------
+    #[test]
+    fn confirm_completion_keeps_asking_on_plain_stop() {
+        // A normally-stopped reply with no completion claim must keep asking,
+        // in EVERY mode, when confirm-completion is on.
+        let st = state("end_turn", "我先改了这个文件，跑了一下看看效果。");
+        for mode in ["safe", "smart", "strict"] {
+            assert!(
+                decide_continue(&st, mode, &[], true).should_continue,
+                "mode={mode} should keep asking"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_completion_stops_on_clear_done() {
+        // Only a genuine completion claim (no trailing unfinished signal) stops it.
+        let st = state("end_turn", "任务已完成，全部测试通过。");
+        for mode in ["safe", "smart", "strict"] {
+            assert!(
+                !decide_continue(&st, mode, &[], true).should_continue,
+                "mode={mode} should stop on done"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_completion_marker_stops_it() {
+        let st = state("end_turn", "全部完成 [[AUTO_CONTINUE_DONE]]");
+        assert!(!decide_continue(&st, "smart", &[], true).should_continue);
+    }
+
+    #[test]
+    fn confirm_completion_trailing_unfinished_beats_earlier_done_word() {
+        // "全部完成" appears mid-text but the reply ends admitting more work:
+        // confirm-completion must keep going.
+        let st = state(
+            "end_turn",
+            "第一部分全部完成。不过还需要继续处理剩余的部分。",
+        );
+        assert!(decide_continue(&st, "smart", &[], true).should_continue);
+    }
+
+    #[test]
+    fn confirm_completion_off_is_unchanged() {
+        // With the flag off, a plain stop in smart mode does NOT continue.
+        let st = state("end_turn", "我先改了这个文件，跑了一下看看效果。");
+        assert!(!decide_continue(&st, "smart", &[], false).should_continue);
     }
 }

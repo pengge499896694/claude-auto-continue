@@ -98,6 +98,10 @@
               <label class="switch"><input type="checkbox" id="cfg-heartbeat" /><span>心跳日志（每次轮询打印各配对窗口状态，便于诊断）</span></label>
             </div>
             <div class="field">
+              <label class="switch"><input type="checkbox" id="cfg-confirm-completion" /><span>确认完成模式（每次停止都追问是否完成，直到明确确认才停）</span></label>
+              <span class="field-label">开启后（不分模式）：只要正常停止且回复未明确表示任务已完成，就反复发送续跑/追问提示词，直到回复出现完成标记（建议在提示词里要求完成时只回复 [[AUTO_CONTINUE_DONE]]）。请配合较大的“最大续跑次数”。</span>
+            </div>
+            <div class="field">
               <label class="switch"><input type="checkbox" id="cfg-keywords-enabled" /><span>自定义关键字触发（命中且未见完成标记时续跑）</span></label>
               <input type="text" id="cfg-keywords" class="input" placeholder="多个关键字用逗号分隔，如：已暂停, waiting for, 等待确认" />
               <span class="field-label">开启后，除内置判断外，回复中出现这些关键字且没有完成标记时，也会触发一次续跑（用于识别异常终止/中途停下）。</span>
@@ -123,6 +127,7 @@
           <button class="btn" id="btn-analyze">立即分析一次</button>
           <button class="btn" id="btn-test">测试发送</button>
           <span class="spacer"></span>
+          <button class="btn btn-ghost" id="btn-check-update">检查更新</button>
           <button class="btn btn-ghost" id="btn-log">打开日志</button>
         </div>
 

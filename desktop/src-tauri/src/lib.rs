@@ -47,6 +47,11 @@ pub struct Config {
     /// When true, the monitor prints a periodic "heartbeat" log line per pair
     /// describing the window/session state it sees each poll (throttled).
     pub heartbeat_log_enabled: bool,
+    /// When true, ANY normally-stopped turn keeps getting a continue prompt (in
+    /// every mode) until the reply clearly declares the task done. Combined with
+    /// a prompt that asks Claude to output the completion marker when finished,
+    /// this gives "keep asking whether it's done until it confirms" behavior.
+    pub confirm_completion: bool,
 }
 
 impl Default for Config {
@@ -67,6 +72,7 @@ impl Default for Config {
             custom_keywords_enabled: false,
             custom_keywords: Vec::new(),
             heartbeat_log_enabled: false,
+            confirm_completion: false,
         }
     }
 }
@@ -716,7 +722,7 @@ fn analyze_now(app: AppHandle, state: State<AppState>) {
     };
     let cfg = state.config.lock().unwrap().clone();
     let st = analyze_transcript(&path);
-    let decision = decide_continue(&st, &cfg.mode, &cfg.effective_keywords());
+    let decision = decide_continue(&st, &cfg.mode, &cfg.effective_keywords(), cfg.confirm_completion);
     if st.is_api_error() {
         emit_log(&app, &format!("检测到 API 错误：{}", st.last_error), "warn");
     }
@@ -1101,7 +1107,7 @@ fn evaluate_pair(app: &AppHandle, state: &AppState, cfg: &Config, id: &str, st: 
     if !st.is_terminal() && !st.is_api_error() {
         return;
     }
-    let decision = decide_continue(st, &cfg.mode, &cfg.effective_keywords());
+    let decision = decide_continue(st, &cfg.mode, &cfg.effective_keywords(), cfg.confirm_completion);
     if !decision.should_continue {
         mark_handled(state, id, &st.fingerprint);
         set_pair_status(app, state, id, &format!("无需续跑：{}", decision.reason), "info");
@@ -1204,6 +1210,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state)
         .setup(move |app| {
             let handle = app.handle().clone();
