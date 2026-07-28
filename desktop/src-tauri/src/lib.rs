@@ -58,7 +58,9 @@ impl Default for Config {
             max_continues: 12,
             mode: "smart".into(),
             target_kind: "auto".into(),
-            prompt: "请继续完成刚才未完成的任务。不要只汇报进度，请直接继续执行；完成实现与必要验证后再结束。"
+            prompt: "请继续完成刚才未完成的任务。不要只汇报进度，请直接继续执行。\
+                如果任务确实已经全部完成、且验证通过，请只回复“[[AUTO_CONTINUE_DONE]]”以结束；\
+                否则请继续执行直到完成。"
                 .into(),
             check_existing: true,
             follow_latest: false,
@@ -1141,12 +1143,21 @@ fn evaluate_pair_interrupted(app: &AppHandle, state: &AppState, cfg: &Config, id
     if !pair_ready(state, id, &st.fingerprint) {
         return;
     }
-    if st.is_terminal() || st.is_api_error() || st.last_user_uuid.is_empty() {
+    // This runs only after `stalled_seconds` of total silence. Terminal stops
+    // and API errors are already handled earlier by evaluate_pair; here we catch
+    // the silent case: a turn that produced output but never reached any stop
+    // reason (the stream was cut mid-answer). After this long a silence it is
+    // genuinely stuck, whether or not the `claude` process is still alive — so
+    // we no longer require the process to have exited.
+    if !st.is_broken_stream() {
         return;
     }
-    if automation::is_claude_session_process_alive(&st.session_id) {
-        return;
-    }
+    let process_gone = !automation::is_claude_session_process_alive(&st.session_id);
+    let reason = if process_gone {
+        "Claude 进程已退出且回合无正常结束记录（疑似意外中断），自动续跑"
+    } else {
+        "回合长时间无输出且无正常结束记录（疑似断流/意外中断），自动续跑"
+    };
     {
         let watch = state.watch.lock().unwrap();
         if let Some(p) = watch.pairs.iter().find(|p| p.id() == id) {
@@ -1167,7 +1178,7 @@ fn evaluate_pair_interrupted(app: &AppHandle, state: &AppState, cfg: &Config, id
             p.sending_fingerprint = st.fingerprint.clone();
         }
     }
-    do_send_for_pair(app, state, id, "Claude 会话进程已退出，且回合没有正常结束记录", &st.cwd);
+    do_send_for_pair(app, state, id, reason, &st.cwd);
 }
 
 fn mark_handled(state: &AppState, id: &str, fingerprint: &str) {

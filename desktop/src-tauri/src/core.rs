@@ -146,6 +146,25 @@ impl TurnState {
     pub fn is_api_error(&self) -> bool {
         !self.last_error.is_empty()
     }
+
+    /// Claude is mid-flight: it is running a tool / still streaming, so the
+    /// absence of a stop reason is expected and must not count as a break.
+    pub fn is_working(&self) -> bool {
+        self.stop_reason.as_deref() == Some("tool_use")
+    }
+
+    /// A silently broken stream: the turn started (there is a user prompt and
+    /// some assistant output) but it never reached *any* terminal stop reason
+    /// and no API error was recorded — the connection just died mid-answer.
+    ///
+    /// This is only meaningful once the transcript has been quiet for a while;
+    /// the caller enforces that, since an in-progress stream looks identical.
+    pub fn is_broken_stream(&self) -> bool {
+        !self.last_user_uuid.is_empty()
+            && !self.is_terminal()
+            && !self.is_api_error()
+            && !self.is_working()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -510,6 +529,16 @@ pub fn decide_continue(state: &TurnState, mode: &str, custom_keywords: &[String]
         };
     }
 
+    // A silently broken stream (no stop reason at all, no API error) means the
+    // answer was cut off mid-flight. The caller only reaches this after the
+    // transcript has been quiet long enough that "still streaming" is ruled out.
+    if state.is_broken_stream() {
+        return ContinueDecision {
+            should_continue: true,
+            reason: "回合被意外中断（无正常结束标记，疑似断流）".into(),
+        };
+    }
+
     if !matches!(
         state.stop_reason.as_deref(),
         Some("end_turn") | Some("stop_sequence")
@@ -655,6 +684,42 @@ mod tests {
     }
 
     #[test]
+    fn broken_stream_continues_in_every_mode() {
+        // A turn with a user prompt and some assistant text but NO stop reason
+        // and NO API error = the stream was cut off mid-answer. Must retry even
+        // in safe mode, since it is an abnormal termination, not a completion.
+        let st = TurnState {
+            last_user_uuid: "u1".into(),
+            stop_reason: None,
+            assistant_text: "我先修改这个文件".into(),
+            ..Default::default()
+        };
+        assert!(st.is_broken_stream());
+        assert!(decide_continue(&st, "safe", &[]).should_continue);
+        assert!(decide_continue(&st, "smart", &[]).should_continue);
+        assert!(decide_continue(&st, "strict", &[]).should_continue);
+    }
+
+    #[test]
+    fn tool_use_is_not_a_broken_stream() {
+        // Mid-flight tool execution has no stop reason either, but it is working,
+        // not broken — it must not be treated as an interrupted stream.
+        let st = TurnState {
+            last_user_uuid: "u1".into(),
+            stop_reason: Some("tool_use".into()),
+            ..Default::default()
+        };
+        assert!(!st.is_broken_stream());
+    }
+
+    #[test]
+    fn no_user_prompt_is_not_a_broken_stream() {
+        // An empty/fresh transcript with no user turn must not look broken.
+        let st = TurnState::default();
+        assert!(!st.is_broken_stream());
+    }
+
+    #[test]
     fn strict_continues_until_completion_marker() {
         let st = state("end_turn", "这一步做完了，我先看看。");
         assert!(decide_continue(&st, "strict", &[]).should_continue);
@@ -693,13 +758,16 @@ mod tests {
 
     // ---- transcript parsing on a real temp .jsonl file --------------------
     fn write_jsonl(lines: &[serde_json::Value]) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let mut path = std::env::temp_dir();
+        // A process-unique counter (not a timestamp) guarantees distinct files
+        // even when tests run in parallel — Windows SystemTime is too coarse to
+        // keep nanosecond names unique, which caused two tests to share a file.
         let unique = format!(
-            "cac_test_{}.jsonl",
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "cac_test_{}_{}.jsonl",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         );
         path.push(unique);
         let mut f = fs::File::create(&path).unwrap();
