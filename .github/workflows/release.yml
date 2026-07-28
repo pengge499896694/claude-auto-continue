@@ -86,6 +86,29 @@ jobs:
         working-directory: desktop
         run: npm install
 
+      # 签名前自检：只打印私钥长度与 base64 可解码性，绝不输出内容。
+      # 用于快速判断 Secret 是否被截断/含多余换行（历史上曾因粘贴出错导致失败）。
+      - name: 校验更新签名私钥（不泄露内容）
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::Secret TAURI_SIGNING_PRIVATE_KEY 为空——未配置或名字不符（需在 Repository secrets 中）。"
+            exit 1
+          fi
+          LEN=$(printf %s "$TAURI_SIGNING_PRIVATE_KEY" | wc -c | tr -d ' ')
+          LINES=$(printf %s "$TAURI_SIGNING_PRIVATE_KEY" | grep -c '' || true)
+          echo "私钥字符数：$LEN；行数：$LINES"
+          # minisign/rsign 私钥文件为两行（注释行 + base64 本体）。本体应能 base64 解码。
+          BODY=$(printf %s "$TAURI_SIGNING_PRIVATE_KEY" | tail -n1)
+          if printf %s "$BODY" | base64 -d >/dev/null 2>&1; then
+            echo "base64 本体可解码：OK"
+          else
+            echo "::error::私钥 base64 本体无法解码——Secret 很可能粘贴不完整或含多余空白。请从 updater_key 文件全选复制后重设。"
+            exit 1
+          fi
+
       - name: 编译并发布（Tauri）
         uses: tauri-apps/tauri-action@v0
         env:
