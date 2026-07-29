@@ -371,15 +371,28 @@ async function checkForUpdates(silent: boolean) {
     toast("正在检查更新…", "info");
     setStatus("正在检查更新…", "info");
   }
+  // The updater's check() fetches latest.json from GitHub. On a bad/blocked
+  // network it can hang ~20s; race it against a timeout so the user gets a
+  // clear "can't reach GitHub" message quickly instead of a frozen-feeling UI.
+  const TIMEOUT_MS = 10000;
   let update;
   try {
-    update = await check();
+    update = await Promise.race([
+      check(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), TIMEOUT_MS)
+      ),
+    ]);
   } catch (e) {
     // Results use the persistent status line (not a 2.6s toast) so they don't
     // flash by and get missed.
+    const timedOut = e instanceof Error && e.message === "timeout";
+    const msg = timedOut
+      ? "连接 GitHub 超时，无法检查更新。请检查网络（或代理）后重试。"
+      : "检查更新失败：" + e;
     if (!silent) {
-      toast("检查更新失败", "error");
-      setStatus("检查更新失败：" + e, "err");
+      toast(timedOut ? "连接 GitHub 超时" : "检查更新失败", "error");
+      setStatus(msg, "err");
     }
     return;
   }
