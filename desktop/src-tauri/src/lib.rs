@@ -86,6 +86,23 @@ impl Config {
             Vec::new()
         }
     }
+
+    /// The prompt actually sent. In confirm-completion mode the loop stops ONLY
+    /// on the `[[AUTO_CONTINUE_DONE]]` marker, so the prompt must instruct the
+    /// model to emit it when done. If the user's custom prompt omits the marker,
+    /// append the instruction automatically — otherwise the loop can never end
+    /// short of the max-continues cap.
+    fn effective_prompt(&self) -> String {
+        let base = self.prompt.trim().to_string();
+        if self.confirm_completion && !base.contains("[[AUTO_CONTINUE_DONE]]") {
+            format!(
+                "{}\n\n如果任务确实已经全部完成、且验证通过，请只回复“[[AUTO_CONTINUE_DONE]]”以结束；否则请继续执行直到完成。",
+                base
+            )
+        } else {
+            base
+        }
+    }
 }
 
 fn app_dir() -> PathBuf {
@@ -800,7 +817,7 @@ fn test_send(app: AppHandle, state: State<AppState>) {
 /// background thread so the monitor loop is never blocked.
 fn do_send_for_pair(app: &AppHandle, state: &AppState, pair_id: &str, reason: &str, project_hint: &str) {
     let cfg = state.config.lock().unwrap().clone();
-    let prompt = cfg.prompt.trim().to_string();
+    let prompt = cfg.effective_prompt();
     if prompt.is_empty() {
         return;
     }

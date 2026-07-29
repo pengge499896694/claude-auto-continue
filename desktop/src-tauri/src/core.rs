@@ -84,6 +84,15 @@ fn matches_any(text: &str, res: &[Regex]) -> bool {
     res.iter().any(|re| re.is_match(text))
 }
 
+/// The one explicit "task truly finished" marker. Confirm-completion mode stops
+/// ONLY on this, never on the fuzzy completion phrases, so a stray "测试通过" in
+/// the middle of ongoing work can't end the loop prematurely.
+const DONE_MARKER: &str = "[[AUTO_CONTINUE_DONE]]";
+
+fn has_done_marker(text: &str) -> bool {
+    text.contains(DONE_MARKER)
+}
+
 /// The trailing portion of a reply, used for "unfinished" detection so that a
 /// mid-reply narrative phrase (e.g. "接下来我来实现…") doesn't count once the
 /// turn actually ends with a completion statement. Returns roughly the last
@@ -584,15 +593,18 @@ pub fn decide_continue(
     // phrase at the tail also forces another round even if a completion word
     // appeared earlier, so a genuine "done" claim is required to stop.
     if confirm_completion {
-        if complete && !unfinished {
+        // Stop ONLY on the explicit marker — never on fuzzy completion phrases,
+        // which show up mid-work and would end the loop too early. If the reply
+        // doesn't carry the marker, ask again regardless of how it's worded.
+        if has_done_marker(text) {
             return ContinueDecision {
                 should_continue: false,
-                reason: "确认完成模式：回复已明确表示任务完成".into(),
+                reason: "确认完成模式：已收到明确完成标记 [[AUTO_CONTINUE_DONE]]".into(),
             };
         }
         return ContinueDecision {
             should_continue: true,
-            reason: "确认完成模式：尚未确认任务完成，追问是否已完成".into(),
+            reason: "确认完成模式：未见明确完成标记，追问是否已完成".into(),
         };
     }
 
@@ -972,32 +984,28 @@ mod tests {
     }
 
     #[test]
-    fn confirm_completion_stops_on_clear_done() {
-        // Only a genuine completion claim (no trailing unfinished signal) stops it.
-        let st = state("end_turn", "任务已完成，全部测试通过。");
+    fn confirm_completion_stops_only_on_marker() {
+        // Only the explicit marker stops it — in every mode.
+        let st = state("end_turn", "全部完成 [[AUTO_CONTINUE_DONE]]");
         for mode in ["safe", "smart", "strict"] {
             assert!(
                 !decide_continue(&st, mode, &[], true).should_continue,
-                "mode={mode} should stop on done"
+                "mode={mode} should stop on the explicit marker"
             );
         }
     }
 
     #[test]
-    fn confirm_completion_marker_stops_it() {
-        let st = state("end_turn", "全部完成 [[AUTO_CONTINUE_DONE]]");
-        assert!(!decide_continue(&st, "smart", &[], true).should_continue);
-    }
-
-    #[test]
-    fn confirm_completion_trailing_unfinished_beats_earlier_done_word() {
-        // "全部完成" appears mid-text but the reply ends admitting more work:
-        // confirm-completion must keep going.
-        let st = state(
-            "end_turn",
-            "第一部分全部完成。不过还需要继续处理剩余的部分。",
-        );
-        assert!(decide_continue(&st, "smart", &[], true).should_continue);
+    fn confirm_completion_ignores_fuzzy_completion_phrases() {
+        // A fuzzy "任务已完成/测试通过" WITHOUT the marker must NOT stop the loop,
+        // because such phrases show up mid-work and would end it prematurely.
+        let st = state("end_turn", "任务已完成，全部测试通过。");
+        for mode in ["safe", "smart", "strict"] {
+            assert!(
+                decide_continue(&st, mode, &[], true).should_continue,
+                "mode={mode} must keep asking without the explicit marker"
+            );
+        }
     }
 
     #[test]
