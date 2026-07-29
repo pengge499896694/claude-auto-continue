@@ -242,10 +242,17 @@ fn emit_log(app: &AppHandle, msg: &str, level: &str) {
     };
     let dir = app_dir();
     let _ = std::fs::create_dir_all(&dir);
+    let path = log_path();
+    // Keep the log from growing without bound: once it passes ~2 MB, rename it
+    // to monitor.log.1 (overwriting any previous one), so at most ~4 MB is kept.
+    const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_LOG_BYTES {
+        let _ = std::fs::rename(&path, dir.join("monitor.log.1"));
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_path())
+        .open(&path)
     {
         use std::io::Write;
         let _ = writeln!(f, "{} {}", entry.time, entry.msg);

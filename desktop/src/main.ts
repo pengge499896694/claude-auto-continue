@@ -366,15 +366,28 @@ async function listenBackend() {
 // `silent` suppresses the "already latest / check failed" toasts (used on the
 // automatic startup check, so it never nags when there's nothing to do).
 async function checkForUpdates(silent: boolean) {
+  // Immediate feedback on a manual click, so it never feels like "no response".
+  if (!silent) {
+    toast("正在检查更新…", "info");
+    setStatus("正在检查更新…", "info");
+  }
   let update;
   try {
     update = await check();
   } catch (e) {
-    if (!silent) toast("检查更新失败：" + e, "error");
+    // Results use the persistent status line (not a 2.6s toast) so they don't
+    // flash by and get missed.
+    if (!silent) {
+      toast("检查更新失败", "error");
+      setStatus("检查更新失败：" + e, "err");
+    }
     return;
   }
   if (!update) {
-    if (!silent) toast("当前已是最新版本", "success");
+    if (!silent) {
+      toast("当前已是最新版本", "success");
+      setStatus("当前已是最新版本", "info");
+    }
     return;
   }
 
